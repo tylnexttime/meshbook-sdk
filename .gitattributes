@@ -1,0 +1,49 @@
+# Line endings are a property of the REPOSITORY, not of whoever cloned it.
+#
+# Without this file, LF-correctness depends on `core.autocrlf` being set on each
+# machine that touches the repo. It happens to be `true` on the Windows dev box
+# (bggr-k), which is why the object store is clean today — but that is a local
+# setting, and the repo is cloned onto Linux hosts (the Brisbane VPS, tnt-open-c1)
+# and would be cloned by CI or a fresh install with no such guarantee.
+#
+# This matters concretely: a CR in a shebang breaks direct execution on Linux
+# (paid for on 2026-07-25 — a drive-sync module had to be reinstalled
+# LF-normalised because a CR in its shebang broke exec). Shell scripts here are
+# rsynced to a production VPS and run there.
+
+# Normalise everything text-like to LF in the object store, detect binary by heuristic.
+* text=auto eol=lf
+
+# Files that MUST be LF regardless — they are executed on Linux.
+*.sh        text eol=lf
+*.py        text eol=lf
+*.cron      text eol=lf
+*.service   text eol=lf
+*.timer     text eol=lf
+*.conf      text eol=lf
+Dockerfile  text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.toml      text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+*.sql       text eol=lf
+
+# Windows-only helpers keep CRLF, or cmd.exe mis-parses them.
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+
+# Never touch these.
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.pdf       binary
+*.zip       binary
+*.gz        binary
+*.db        binary
+*.sqlite    binary
+*.woff      binary
+*.woff2     binary
