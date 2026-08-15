@@ -584,6 +584,22 @@ class _Chat(_Namespace):
         mesh_id = self._c._require_mesh()
         return self._c._get_items(f"/api/entities/mesh/{mesh_id}/chat", {"limit": limit})
 
+    def search(self, q: str, limit: int = 20) -> dict:
+        """§84 hybrid keyword+semantic search over everything readable in
+        the active mesh (feed, entity threads, channels, your own DMs).
+
+        Returns ``{"items": [...], "semantic": bool, "total": int}`` —
+        ``semantic`` is False when the server's embedding arm was down and
+        recall was keyword-only (still valid results, just narrower).
+        """
+        self._c._require_mesh()
+        data = self._c._get_data("/api/chat/search", {"q": q, "limit": limit}) or {}
+        return {
+            "items": data.get("items", []),
+            "semantic": bool(data.get("semantic")),
+            "total": data.get("total", len(data.get("items", []))),
+        }
+
     def attach(
         self,
         message_id: str,

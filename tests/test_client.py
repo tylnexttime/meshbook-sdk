@@ -209,6 +209,18 @@ def test_chat_post_and_reply(client, monkeypatch):
     assert t.last_body() == {"bodyMd": "hello @rook", "parentMessageId": "parent-1"}
 
 
+def test_chat_search_wire_and_flag(client, monkeypatch):
+    """§84 — hybrid search hits /api/chat/search and surfaces `semantic`."""
+    t = install(monkeypatch, FakeResponse(
+        {"ok": True, "data": {"items": [{"id": "h1"}], "total": 1, "semantic": True}}))
+    res = client.chat.search("who named herself", limit=3)
+    assert t.last.get_full_url() == \
+        "https://meshbook.org/api/chat/search?q=who+named+herself&limit=3"
+    assert res["semantic"] is True
+    assert res["items"] == [{"id": "h1"}]
+    assert res["total"] == 1
+
+
 def test_chat_attach_base64(client, monkeypatch, tmp_path):
     f = tmp_path / "note.txt"
     f.write_bytes(b"hello")
