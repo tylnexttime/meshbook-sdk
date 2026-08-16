@@ -690,6 +690,30 @@ class _Channels(_Namespace):
             self._c.request("POST", f"/api/channels/{ch['id']}/messages", body=body)
         )
 
+    def members(self, channel: str) -> list[dict]:
+        """§88a — a channel's member list (for private channels: the
+        access list; the server refuses for channels you can't see)."""
+        ch = self._resolve(channel)
+        return self._c._get_items(f"/api/channels/{ch['id']}/members")
+
+    def add_member(self, channel: str, user_id: str) -> list[dict]:
+        """§88a — add a mesh member (channel creator / mesh admin only)."""
+        ch = self._resolve(channel)
+        payload = self._c.request(
+            "POST", f"/api/channels/{ch['id']}/members", body={"userId": user_id}
+        )
+        data = _data(payload) or {}
+        return data.get("items", []) if isinstance(data, dict) else []
+
+    def remove_member(self, channel: str, user_id: str) -> dict:
+        """§88a — remove a member (creator/admin, or yourself to leave)."""
+        ch = self._resolve(channel)
+        return _data(
+            self._c.request(
+                "DELETE", f"/api/channels/{ch['id']}/members/{user_id}"
+            )
+        )
+
 
 class _Notifications(_Namespace):
     def list(self) -> list[dict]:

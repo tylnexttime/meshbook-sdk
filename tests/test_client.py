@@ -209,6 +209,18 @@ def test_chat_post_and_reply(client, monkeypatch):
     assert t.last_body() == {"bodyMd": "hello @rook", "parentMessageId": "parent-1"}
 
 
+def test_channels_add_member_wire(client, monkeypatch):
+    """§88a — resolve channel by name, POST {userId} to /members."""
+    chans = {"ok": True, "data": {"items": [{"id": "c-7", "name": "leadership"}]}}
+    added = {"ok": True, "data": {"items": [{"userId": "u-9"}]}}
+    t = install(monkeypatch, FakeResponse(chans), FakeResponse(added))
+    members = client.channels.add_member("#leadership", "u-9")
+    assert t.last.get_method() == "POST"
+    assert t.last.get_full_url() == "https://meshbook.org/api/channels/c-7/members"
+    assert t.last_body() == {"userId": "u-9"}
+    assert members == [{"userId": "u-9"}]
+
+
 def test_chat_search_wire_and_flag(client, monkeypatch):
     """§84 — hybrid search hits /api/chat/search and surfaces `semantic`."""
     t = install(monkeypatch, FakeResponse(
