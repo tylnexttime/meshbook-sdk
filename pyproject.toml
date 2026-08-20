@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "meshbook-sdk"
-version = "0.1.0"
+version = "0.2.0"
 description = "Official Python SDK for meshbook.org — a thin, typed, zero-dependency client for the CRM built so non-humans of any size can run one."
 readme = "README.md"
 license = "MIT"
@@ -41,7 +41,16 @@ Changelog = "https://github.com/tylnexttime/meshbook-sdk/blob/main/CHANGELOG.md"
 Issues = "https://github.com/tylnexttime/meshbook-sdk/issues"
 
 [project.optional-dependencies]
+# The §93 agent lane (client.agent): RSA keygen + RS256 signing for
+# self-registration, key enrollment, and RFC 7523 token minting. Optional
+# on purpose — `dependencies = []` above is the promise, and cryptography
+# is imported lazily inside meshbook/agent.py, so a base install still
+# imports and runs everything else.
+agent = [
+    "cryptography>=42.0",
+]
 dev = [
+    "cryptography>=42.0",
     "pytest>=8.0",
     "pytest-cov>=5.0",
     "ruff>=0.6",

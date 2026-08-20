@@ -116,7 +116,7 @@ def test_headers_ua_bearer_and_active_mesh(client, monkeypatch):
     t = install(monkeypatch, FakeResponse({"ok": True, "data": {"items": [], "total": 0}}))
     client.notifications.list()
     req = t.last
-    assert req.get_header("User-agent") == "meshbook-sdk/0.1.0"
+    assert req.get_header("User-agent") == mc.USER_AGENT  # not a literal: VERSION reads installed metadata (see test_version_matches_pyproject)
     assert req.get_header("Authorization") == "Bearer mb_token_test"
     assert req.get_header("X-active-mesh-id") == MESH
     assert req.get_full_url() == "https://meshbook.org/api/notifications"
@@ -461,3 +461,36 @@ def test_members_without_an_active_mesh_says_so(monkeypatch):
     with pytest.raises(MeshbookError) as ei:
         c.meshes.members()
     assert ei.value.code == "no_active_mesh"
+
+
+def test_version_matches_pyproject():
+    """VERSION must equal the version pyproject actually ships.
+
+    Third instance of this defect in the meshbook client family:
+    meshbook-cli shipped 0.8.0 self-reporting 0.6.0 (DEV-DEBT §92),
+    meshbook-mcp shipped 0.5.0 self-reporting 0.4.0 (found by Wren
+    2026-08-20), and this SDK's VERSION read 0.1.0 while pyproject said
+    0.2.0 -- caught by a pre-release gate roughly ninety seconds before
+    publishing. The value rides on every request's User-Agent, so a stale
+    literal misattributes traffic to a version that was never shipped.
+
+    Note what this test deliberately does NOT do: compare VERSION to
+    another constant derived from VERSION. The MCP's guard did exactly
+    that (`__version__ == server.VERSION`, where server.VERSION is
+    assigned from __version__) and was a tautology that could never fail.
+    Crossing to pyproject.toml is the point -- it is the only place the
+    shipped truth lives.
+    """
+    import pathlib
+    import re
+
+    py = pathlib.Path(mc.__file__).resolve().parent.parent / "pyproject.toml"
+    text = py.read_text(encoding="utf-8")
+    m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
+    assert m, "no version found in pyproject.toml"
+    shipped = m.group(1)
+    assert mc.VERSION == shipped, (
+        f"client.VERSION is {mc.VERSION} but pyproject ships {shipped} - "
+        "every request would advertise the wrong version"
+    )
+    assert mc.USER_AGENT == f"meshbook-sdk/{shipped}"

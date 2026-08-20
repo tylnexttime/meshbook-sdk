@@ -10,7 +10,9 @@ X-Active-Mesh-Id header contract. Differences from the CLI:
   subcommands.
 * Never writes the config file. ``client.meshes.use()`` only changes
   the in-memory active mesh for this client instance; the CLI remains
-  the owner of ~/.meshbook/config.
+  the owner of ~/.meshbook/config. (The agent lane in
+  :mod:`meshbook.agent` does write key material — that is the one
+  exception, and it writes only the two ``agent-key.*`` files.)
 
 Return shapes
 -------------
@@ -37,7 +39,24 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.1.0"
+# Read from the INSTALLED package metadata, never hardcoded. A literal here
+# goes stale the moment pyproject is bumped, and the value rides on every
+# request's User-Agent -- so the server's logs would attribute traffic to a
+# version that was never shipped.
+#
+# This is the THIRD instance of the same defect in this family, which is why
+# it is worth a comment rather than a one-liner: meshbook-cli shipped 0.8.0
+# self-reporting 0.6.0 (fixed as DEV-DEBT §92), meshbook-mcp shipped 0.5.0
+# self-reporting 0.4.0 (found by Wren 2026-08-20), and this constant read
+# 0.1.0 while pyproject said 0.2.0 -- caught by a pre-release gate about
+# ninety seconds before publishing. The guarding test below crosses to
+# pyproject.toml, which is the only place the shipped truth lives.
+try:
+    from importlib.metadata import version as _pkg_version
+
+    VERSION = _pkg_version("meshbook-sdk")
+except Exception:  # uninstalled dev checkout only
+    VERSION = "0.0.0+uninstalled"
 USER_AGENT = f"meshbook-sdk/{VERSION}"  # Cloudflare blocks default UAs
 DEFAULT_BASE = "https://meshbook.org"
 
@@ -222,16 +241,40 @@ def _filename_from_disposition(disp: str) -> str:
     return "attachment"
 
 
+def _err_fields(payload: Any, raw: str) -> tuple[str, str]:
+    """(code, message) out of any of the three error shapes the API emits.
+
+    Ours is ``{"error": {code, message}}``. Anything raised as a FastAPI
+    HTTPException skips the envelope entirely and arrives as
+    ``{"detail": {code, message}}`` or ``{"detail": "string"}`` — which is
+    every 401, because ``require_user`` raises bare and no handler is
+    registered for it. Reading only ``error`` reports those as
+    ``http_error: {"detail": …}``, leaking an implementation detail to the
+    caller. Ported from meshbook-cli's ``_err_fields`` (2026-08-20).
+    """
+    if isinstance(payload, dict):
+        err = payload.get("error")
+        if isinstance(err, dict):
+            return str(err.get("code") or "http_error"), str(err.get("message") or raw[:200])
+        detail = payload.get("detail")
+        if isinstance(detail, dict):
+            return (
+                str(detail.get("code") or "http_error"),
+                str(detail.get("message") or raw[:200]),
+            )
+        if isinstance(detail, str) and detail:
+            return "http_error", detail
+    return "http_error", raw[:200]
+
+
 def _raise_from_http_error(e: urllib.error.HTTPError) -> None:
     raw = e.read().decode("utf-8", "replace") if e.fp else "{}"
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
         raise MeshbookError("http_error", raw[:200], status=e.code) from e
-    err = (payload.get("error") or {}) if isinstance(payload, dict) else {}
-    raise MeshbookError(
-        err.get("code", "http_error"), err.get("message", raw[:200]), status=e.code
-    ) from e
+    code, message = _err_fields(payload, raw)
+    raise MeshbookError(code, message, status=e.code) from e
 
 
 # ─── the client ────────────────────────────────────────────────────────
@@ -256,6 +299,19 @@ class MeshbookClient:
         config_path: explicit path to a CLI-format config file (JSON
             with ``token`` / ``base`` / ``active_mesh_id`` keys).
         timeout: per-request timeout in seconds (default 30; downloads 120).
+        auth: ``"bearer"`` (default — the long-lived ``mb_token_`` above,
+            unchanged) or ``"agent"``, in which case every authenticated
+            call uses a §93 token this client mints for itself from the
+            enrolled private key (see ``client.agent``). Opt-in: an
+            existing caller passing ``token=`` behaves exactly as before,
+            and ``client.auth`` can be flipped after construction once a
+            key is enrolled.
+        agent_key_path: where the agent private key lives. Defaults to
+            ``agent-key.pem`` beside the config file — the same file
+            ``mesh agent enroll`` writes — with the mint bundle alongside
+            as ``agent-key.json``. Pass an explicit path when several
+            identities share a box; one config dir means one agent
+            identity, and both reference clients hardcode that assumption.
     """
 
     def __init__(
@@ -265,13 +321,31 @@ class MeshbookClient:
         active_mesh_id: str | None = None,
         config_path: str | os.PathLike | None = None,
         timeout: float = 30.0,
+        auth: str = "bearer",
+        agent_key_path: str | os.PathLike | None = None,
     ):
-        cfg = _load_config(config_path)
+        if auth not in ("bearer", "agent"):
+            raise MeshbookError(
+                "bad_auth", f"Unknown auth mode {auth!r}. Use 'bearer' (default) or 'agent'."
+            )
+        self.config_path = Path(config_path) if config_path else _default_config_path()
+        cfg = _load_config(self.config_path)
         self.token = token or os.environ.get("MESHBOOK_TOKEN") or cfg.get("token")
         resolved_base = base or os.environ.get("MESHBOOK_BASE") or cfg.get("base") or DEFAULT_BASE
         self.base = resolved_base.rstrip("/")
         self.active_mesh_id = active_mesh_id or cfg.get("active_mesh_id")
         self.timeout = timeout
+        self.auth = auth
+        self.agent_key_path = (
+            Path(agent_key_path).expanduser()
+            if agent_key_path
+            else self.config_path.parent / "agent-key.pem"
+        )
+
+        # _Agent lives in meshbook/agent.py because it is the one surface
+        # with an optional dependency; that module imports this one, so it
+        # is imported here rather than at module scope.
+        from .agent import _Agent
 
         self.meshes = _Meshes(self)
         self.contacts = _Contacts(self)
@@ -282,21 +356,46 @@ class MeshbookClient:
         self.notifications = _Notifications(self)
         self.files = _Files(self)
         self.exports = _Exports(self)
+        self.agent = _Agent(self)
 
         self._me_cache: dict | None = None
+        self._agent_token: str | None = None
+        self._agent_token_expires_at: float = 0.0
 
     # ── plumbing ──────────────────────────────────────────────────────
 
-    def _headers(self, *, require_auth: bool = True) -> dict:
+    def _bearer(self) -> str:
+        """The credential for an authenticated call.
+
+        ``auth="bearer"`` (default) → the long-lived ``mb_token_`` token,
+        exactly as before. ``auth="agent"`` → a §93 token this client mints
+        for itself from the enrolled private key, cached and re-minted
+        shortly before it expires (see ``client.agent.token``).
+        """
+        if self.auth == "agent":
+            return self.agent.token()
+        if not self.token:
+            raise MeshbookError(
+                "not_authenticated",
+                "No API token. Pass token=, set MESHBOOK_TOKEN, or run `mesh login`.",
+            )
+        return self.token
+
+    def _headers(
+        self,
+        *,
+        require_auth: bool = True,
+        token: str | None = None,
+        send_active_mesh: bool = True,
+    ) -> dict:
         headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
         if require_auth:
-            if not self.token:
-                raise MeshbookError(
-                    "not_authenticated",
-                    "No API token. Pass token=, set MESHBOOK_TOKEN, or run `mesh login`.",
-                )
-            headers["Authorization"] = f"Bearer {self.token}"
-        if self.active_mesh_id:
+            headers["Authorization"] = f"Bearer {token or self._bearer()}"
+        # Unauthenticated endpoints never carry the active mesh: the one
+        # that matters (§97 agent registration) is for callers who do not
+        # exist yet, and inheriting a config dir's mesh there makes a
+        # "fresh" registration quietly stateful.
+        if send_active_mesh and require_auth and self.active_mesh_id:
             headers["X-Active-Mesh-Id"] = str(self.active_mesh_id)
         return headers
 
@@ -316,11 +415,19 @@ class MeshbookClient:
         body: dict | None = None,
         params: dict | None = None,
         require_auth: bool = True,
+        token: str | None = None,
+        send_active_mesh: bool = True,
     ) -> Any:
         """Raw escape hatch: call any /api path, get the parsed JSON
         payload back (envelope NOT stripped — use ``meshbook.client._data``
-        / ``_items`` or the namespaced methods for that)."""
-        headers = self._headers(require_auth=require_auth)
+        / ``_items`` or the namespaced methods for that).
+
+        ``token=`` overrides this call's Authorization (the agent lane uses
+        it to present a freshly minted token without touching client
+        state); ``send_active_mesh=False`` suppresses X-Active-Mesh-Id."""
+        headers = self._headers(
+            require_auth=require_auth, token=token, send_active_mesh=send_active_mesh
+        )
         data = None
         if body is not None:
             data = json.dumps(body).encode("utf-8")
