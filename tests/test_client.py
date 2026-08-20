@@ -367,3 +367,97 @@ def test_items_unwraps_all_three_list_shapes():
     assert mc._items({"data": bare}) == bare
     assert mc._items({"ok": True, "data": {"items": bare, "total": 1}}) == bare
     assert mc._items({"ok": True, "data": None}) == []
+
+
+# ─── the active-mesh trap (Wren, 2026-08-20) ───────────────────────────
+
+
+def test_use_verifies_with_the_server_before_switching(client, monkeypatch):
+    """`use()` must ASK, not just resolve locally and assume.
+
+    Membership is not the predicate the server gates on -- it gates on the
+    token's scope_meshes. Before this, a member with a narrower token got a
+    Mesh object back and then had every later call fail token_out_of_scope
+    with nothing explaining why.
+    """
+    rows = [{"id": "aaa", "name": "Tyl Mesh", "meshType": "family", "memberRole": "admin"}]
+    t = install(monkeypatch, FakeResponse({"ok": True, "data": {"items": rows, "total": 1}}))
+    client.meshes.use("Tyl Mesh")
+    posts = [r for r in t.requests if r.get_method() == "POST"]
+    assert posts, "use() did not verify with the server"
+    assert posts[-1].get_full_url().endswith("/api/meshes/active")
+    assert json.loads(posts[-1].data.decode())["meshId"] == "aaa"
+
+
+def test_use_leaves_state_untouched_when_the_server_refuses(client, monkeypatch):
+    """A refusal must not half-apply. The caller's current mesh keeps working.
+
+    This is the regression that matters: the old code set active_mesh_id
+    unconditionally, so a rejected switch still changed the client.
+    """
+    before = client.active_mesh_id
+    rows = [{"id": "aaa", "name": "Tyl Mesh", "meshType": "family", "memberRole": "admin"}]
+
+    calls = {"n": 0}
+
+    def transport(req, timeout):
+        calls["n"] += 1
+        if req.get_method() == "POST":
+            raise urllib.error.HTTPError(
+                req.get_full_url(), 403, "Forbidden", {},
+                io.BytesIO(json.dumps({
+                    "ok": False,
+                    "error": {"code": "token_out_of_scope",
+                              "message": "not authorised for that mesh"},
+                }).encode()))
+        return FakeResponse({"ok": True, "data": {"items": rows, "total": 1}})
+
+    monkeypatch.setattr(mc, "_urlopen", transport)
+    with pytest.raises(MeshbookError) as ei:
+        client.meshes.use("Tyl Mesh")
+    assert ei.value.code == "token_out_of_scope"
+    assert client.active_mesh_id == before, "a refused switch must not change state"
+
+
+def test_use_verify_false_skips_the_round_trip(client, monkeypatch):
+    """The offline escape hatch still exists, and is opt-in rather than default."""
+    rows = [{"id": "aaa", "name": "Tyl Mesh", "meshType": "family", "memberRole": "admin"}]
+    t = install(monkeypatch, FakeResponse({"ok": True, "data": {"items": rows, "total": 1}}))
+    client.meshes.use("Tyl Mesh", verify=False)
+    assert [r for r in t.requests if r.get_method() == "POST"] == []
+    assert client.active_mesh_id == "aaa"
+
+
+def test_members_reads_detail_and_reports_a_count(client, monkeypatch):
+    """Wren, report A6: every client could ACT on membership, none could SEE it.
+
+    No new endpoint was needed -- /detail carried the roster all along. The
+    count is explicit so "found zero" and "silently did nothing" differ.
+    """
+    detail = {"ok": True, "data": {
+        "mesh": {"name": "The Tyl Mesh"},
+        "members": [
+            {"username": "wren", "role": "member", "identityType": "ai"},
+            {"username": "tylnexttime", "role": "admin", "identityType": "human"},
+        ],
+        "pendingInvites": [{"username": "someone"}],
+        "pendingRequests": [],
+    }}
+    t = install(monkeypatch, FakeResponse(detail))
+    out = client.meshes.members()
+    assert t.last.get_full_url().endswith(f"/api/meshes/{MESH}/detail")
+    assert out["count"] == 2
+    assert out["mesh"] == "The Tyl Mesh"
+    assert len(out["pendingInvites"]) == 1
+    assert out["pendingRequests"] == []
+    assert {m["username"] for m in out["members"]} == {"wren", "tylnexttime"}
+
+
+def test_members_without_an_active_mesh_says_so(monkeypatch):
+    """An unset mesh is a named error, not an empty result."""
+    monkeypatch.delenv("MESHBOOK_TOKEN", raising=False)
+    c = MeshbookClient(token="mb_token_test", config_path="Z:/nonexistent/config")
+    install(monkeypatch, FakeResponse({"ok": True, "data": {}}))
+    with pytest.raises(MeshbookError) as ei:
+        c.meshes.members()
+    assert ei.value.code == "no_active_mesh"

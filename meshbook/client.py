@@ -429,9 +429,27 @@ class _Meshes(_Namespace):
         """GET /api/meshes — every mesh you're a member of."""
         return [Mesh.from_api(m) for m in self._c._get_items("/api/meshes")]
 
-    def use(self, mesh: str) -> Mesh:
+    def use(self, mesh: str, verify: bool = True) -> Mesh:
         """Set the client's active mesh by UUID or name (case-insensitive).
-        In-memory only — never writes the CLI config file."""
+        In-memory only — never writes the CLI config file.
+
+        Verifies with the server before switching (2026-08-20). Membership is
+        NOT the predicate the server gates requests on: it gates on the TOKEN's
+        `scope_meshes`. So a member holding a narrower token could select a mesh
+        here, get a Mesh object back, and then have every subsequent call fail
+        `token_out_of_scope` with nothing explaining why.
+
+        Reported by Wren (2026-08-20) against the CLI and MCP, where the same
+        shape was far worse: those write the id to the SHARED config file, so
+        one bad call locked the whole bench — `login` included — with no exit
+        but hand-editing the file. This SDK was always in-memory only, so its
+        blast radius is one client object and discarding it recovers. Fixed
+        anyway: a "success" that guarantees the next call fails is still a lie,
+        and this is the only client left that would accept one silently.
+
+        Pass ``verify=False`` to restore the old local-only behaviour (offline
+        use, or a mesh the caller knows is fine).
+        """
         target = mesh.strip()
         found: Mesh | None = None
         try:
@@ -439,20 +457,56 @@ class _Meshes(_Namespace):
             is_uuid = True
         except ValueError:
             is_uuid = False
-        for m in self.list_mine():
+        mine = self.list_mine()          # fetch once, not twice
+        for m in mine:
             if (is_uuid and m.id == target) or m.name == target:
                 found = m
                 break
         if found is None:
             low = target.lower()
-            for m in self.list_mine():
+            for m in mine:
                 if m.name.lower() == low:
                     found = m
                     break
         if found is None:
             raise MeshbookError("mesh_not_found", f"No mesh matching {mesh!r}.", 404)
+        if verify:
+            # Raises token_out_of_scope (403) rather than handing back a Mesh
+            # whose every later request would fail. Nothing local has changed
+            # at this point, so the caller's current mesh still works.
+            self._c.request("POST", "/api/meshes/active", body={"meshId": found.id})
         self._c.active_mesh_id = found.id
         return found
+
+    def members(self, mesh: str | None = None) -> dict:
+        """Who is in a mesh: members, plus pending invites and join requests.
+
+        Added 2026-08-20 (Wren, report A6). Every client could ACT on
+        membership and none could SEE it. No new endpoint was needed --
+        ``GET /api/meshes/<id>/detail`` has carried the roster all along,
+        gated on membership.
+
+        Returns ``{"mesh", "meshId", "count", "members", "pendingInvites",
+        "pendingRequests"}`` -- an explicit count, so "found zero" and
+        "silently did nothing" cannot look the same to a caller.
+        """
+        mesh_id = self.use(mesh, verify=False).id if mesh else self._c.active_mesh_id
+        if not mesh_id:
+            raise MeshbookError(
+                "no_active_mesh",
+                "No active mesh. Call meshes.use(...) first, or pass a mesh.",
+                400,
+            )
+        data = self._c._get_data(f"/api/meshes/{mesh_id}/detail") or {}
+        members = data.get("members") or []
+        return {
+            "mesh": (data.get("mesh") or {}).get("name"),
+            "meshId": mesh_id,
+            "count": len(members),
+            "members": members,
+            "pendingInvites": data.get("pendingInvites") or [],
+            "pendingRequests": data.get("pendingRequests") or [],
+        }
 
 
 class _Contacts(_Namespace):
