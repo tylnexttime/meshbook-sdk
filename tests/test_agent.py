@@ -810,3 +810,73 @@ def test_mutation_leaked_private_jwk_turns_the_enroll_test_red(agent_client, mon
     agent_client.agent.enroll()
     with pytest.raises(AssertionError):
         _check_no_private_material(t.requests, agent_client.agent.key_path)
+
+
+# ─── §99: rotation proof (enroll over an existing key) ─────────────────
+#
+# The server's agent-JWT lane refuses a bare re-enroll: replacing the
+# seat's root key demands a rotationAssertion signed by the OUTGOING key,
+# aud "meshbook-agent-rotation", bound to the incoming kid. The aud is
+# hardcoded here for the same reason REGISTRATION_AUD is.
+
+ROTATION_AUD = "meshbook-agent-rotation"
+
+
+def _rotation_claims(body_old: dict, body_new: dict) -> dict:
+    """Verify the rotation assertion against the OUTGOING public key and
+    return its claims. The header kid must be the kid the server knows
+    the current key by (the persisted meta kid, i.e. the server echo)."""
+    hashes, _serialization, padding, rsa = _crypto()
+    compact = body_new["rotationAssertion"]
+    head_b64, claims_b64, sig_b64 = compact.split(".")
+    header = json.loads(_b64u_decode(head_b64))
+    assert header["alg"] == "RS256"
+    assert header["kid"] == ECHO_KID, "rotation must name the CURRENT key as the server knows it"
+    jwk_old = body_old["publicKey"]
+    n = int.from_bytes(_b64u_decode(jwk_old["n"]), "big")
+    e = int.from_bytes(_b64u_decode(jwk_old["e"]), "big")
+    pub = rsa.RSAPublicNumbers(e, n).public_key()
+    pub.verify(
+        _b64u_decode(sig_b64),
+        f"{head_b64}.{claims_b64}".encode("ascii"),
+        padding.PKCS1v15(),
+        hashes.SHA256(),
+    )
+    return json.loads(_b64u_decode(claims_b64))
+
+
+def test_enroll_rotation_signs_with_the_outgoing_key(agent_client, monkeypatch):
+    t = install(monkeypatch, FakeResponse({"ok": True, "data": BUNDLE}))
+    agent_client.agent.enroll()                       # key A — first enrollment
+    first_body = t.last_body()
+    assert "rotationAssertion" not in first_body, "nothing to prove on first enroll"
+
+    agent_client.agent.enroll(force=True)             # key B — rotation
+    second_body = t.last_body()
+    claims = _rotation_claims(first_body, second_body)
+    assert claims["aud"] == ROTATION_AUD
+    assert claims["sub"] == "wanderer"                # the persisted meta username
+    assert claims["new_kid"] == second_body["publicKey"]["kid"]
+    now = int(time.time())
+    assert now - claims["iat"] >= 30, "iat must be backdated against clock skew"
+    assert 0 < claims["exp"] - claims["iat"] <= 600
+
+    # The outgoing generation survives as .bak beside the new files.
+    kp = agent_client.agent.key_path
+    assert kp.with_suffix(kp.suffix + ".bak").exists()
+    mp = agent_client.agent.meta_path
+    assert mp.with_suffix(mp.suffix + ".bak").exists()
+
+
+def test_rotation_assertion_is_not_signed_by_the_incoming_key(agent_client, monkeypatch):
+    """The decisive property: proving possession of the REPLACEMENT key
+    proves nothing (an attacker always holds their own new key). The
+    assertion must fail verification against the key it installs."""
+    from cryptography.exceptions import InvalidSignature
+
+    t = install(monkeypatch, FakeResponse({"ok": True, "data": BUNDLE}))
+    agent_client.agent.enroll()
+    agent_client.agent.enroll(force=True)
+    body = t.last_body()
+    with pytest.raises((InvalidSignature, AssertionError)):
+        _rotation_claims(body, body)   # verify against the NEW key instead

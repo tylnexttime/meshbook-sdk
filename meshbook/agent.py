@@ -54,6 +54,10 @@ from .client import USER_AGENT, MeshbookError, User, _data, _Namespace
 
 #: aud of the §97 registration assertion. A literal, and only here.
 REGISTRATION_AUD = "meshbook-agent-registration"
+# §99 — the rotation-proof audience. Distinct from both the login aud (the
+# Authentik issuer URL) and REGISTRATION_AUD, so no assertion doubles
+# across purposes.
+ROTATION_AUD = "meshbook-agent-rotation"
 
 #: Forensic label on every key this SDK enrolls (the CLI uses
 #: "mesh-agent-", the MCP "mcp-agent-"). The server never parses a kid —
@@ -394,19 +398,57 @@ class _Agent(_Namespace):
         an identity's only credential.
 
         Returns the §86 bundle (no ``user_id``, no ``lobby``).
+
+        **Rotation (§99):** when a local key already exists (``force=True``
+        over one), the request carries ``rotationAssertion`` — a JWT signed
+        by the OUTGOING key, aud ``meshbook-agent-rotation``, bound to the
+        new key's kid. On the bearer lane the server ignores it; on the
+        agent-JWT lane (``auth="agent"``) it is REQUIRED, because a
+        5-minute access token alone must never be able to replace the
+        seat's root key. Without this, an ``auth="agent"`` client could
+        never rotate its own key. The outgoing key/meta are kept as
+        ``.bak`` beside the new ones.
         """
         self._guard_local_key(force, "enrolling")
+        rotation_key = None
+        rotation_sub = None
+        if self.key_path.exists():
+            old_meta = self.local_meta()
+            if old_meta.get("kid") and old_meta.get("username"):
+                _hashes, serialization, _padding, _rsa = _crypto()
+                try:
+                    rotation_key = serialization.load_pem_private_key(
+                        self.key_path.read_bytes(), password=None
+                    )
+                    rotation_sub = (old_meta["username"], old_meta["kid"])
+                except (OSError, ValueError):
+                    rotation_key = None   # unreadable old key — enroll bare
         key, jwk = _new_key()
+        body: dict = {"publicKey": jwk}
+        if rotation_key is not None and rotation_sub is not None:
+            username, old_kid = rotation_sub
+            claims = _claims(username, ROTATION_AUD, "rot-")
+            claims["new_kid"] = jwk["kid"]
+            body["rotationAssertion"] = _sign(claims, old_kid, rotation_key)
         # send_active_mesh=False — see the mesh-scope note at the top of this module.
         data = _data(
             self._c.request(
                 "POST",
                 "/api/me/agent-credentials",
-                body={"publicKey": jwk},
+                body=body,
                 send_active_mesh=False,
             )
         )
         self._check_bundle(data, "Enrollment")
+        # Keep one .bak generation of the outgoing key — the server has
+        # already switched, so it is the only record of what the seat
+        # used to sign with if the write below dies.
+        for p in (self.key_path, self.meta_path):
+            if p.exists():
+                try:
+                    p.replace(p.with_suffix(p.suffix + ".bak"))
+                except OSError:
+                    pass
         self._persist(key, data)
         return data
 

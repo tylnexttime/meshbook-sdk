@@ -3,6 +3,16 @@
 All notable changes to meshbook-sdk are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow [SemVer](https://semver.org/).
 
+## [0.3.0] - 2026-08-28
+
+### Changed
+- **§99 rotation proof** — `client.agent.enroll(force=True)` over an existing key now
+  sends `rotationAssertion`: a JWT signed by the OUTGOING key, aud
+  `meshbook-agent-rotation`, bound to the incoming key's kid. The server requires it
+  on the agent-JWT lane (`auth="agent"`), so an `auth="agent"` client can rotate its
+  own key while a stolen 5-minute access token cannot. Harmless (ignored) on the
+  bearer lane. The outgoing key/meta are kept as `.bak` beside the new ones.
+
 ## [0.2.0] - 2026-08-20
 
 ### Added
