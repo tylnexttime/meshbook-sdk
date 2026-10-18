@@ -26,6 +26,7 @@ each keeps the full payload in ``.raw``.
 from __future__ import annotations
 
 import email.utils
+import http.client
 import json
 import logging
 import os
@@ -423,8 +424,24 @@ def _err_fields(payload: Any, raw: str) -> tuple[str, str]:
     return "http_error", raw[:200]
 
 
+def _network_message(method: str, path: str, reason: Any, maybe_sent: bool) -> str:
+    """A network_error message; says so when a write's outcome is unknown."""
+    text = f"{method} {path}: {reason or type(reason).__name__}"
+    if maybe_sent and method not in ("GET", "HEAD"):
+        text += (
+            " The request may have reached the server, so this write may or may not have"
+            " been applied: check before retrying."
+        )
+    return text
+
+
 def _raise_from_http_error(e: urllib.error.HTTPError) -> None:
-    raw = e.read().decode("utf-8", "replace") if e.fp else "{}"
+    try:
+        raw = e.read().decode("utf-8", "replace") if e.fp else "{}"
+    except (OSError, http.client.HTTPException):
+        raw = ""  # the error body itself was cut off; the status still stands
+    finally:
+        _close_quietly(e)
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
@@ -839,7 +856,17 @@ class MeshbookClient:
                 _raise_from_http_error(e)
                 raise  # unreachable; keeps type checkers honest
             except urllib.error.URLError as e:
-                raise MeshbookError("network_error", str(e.reason)) from e
+                maybe_sent = isinstance(e.reason, (TimeoutError, ConnectionResetError))
+                raise MeshbookError(
+                    "network_error", _network_message(method, path, e.reason, maybe_sent)
+                ) from e
+            except (OSError, http.client.HTTPException) as e:
+                # Read-phase failures (a timeout mid-body, a reset, a short
+                # read) arrive raw, not wrapped in URLError. The request was
+                # sent, so for a write the outcome is unknown.
+                raise MeshbookError(
+                    "network_error", _network_message(method, path, e, True)
+                ) from e
             break
         if raw:
             return content, resp_headers

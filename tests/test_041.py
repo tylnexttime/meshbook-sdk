@@ -120,3 +120,73 @@ def test_log_time_defaults_to_the_local_date_not_utc(client, monkeypatch):
     assert r.body()["loggedForDate"] == "2026-10-20"
     client.tasks.log_time("t1", 1.5, date="2026-10-01")
     assert r.body()["loggedForDate"] == "2026-10-01"
+
+
+# ─── critique C-16: read-phase network failures are MeshbookError ──────
+
+
+class _BrokenBody:
+    headers: dict = {}
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def read(self):
+        raise self._exc
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [TimeoutError("timed out"), ConnectionResetError("reset"),
+     __import__("http.client").client.IncompleteRead(b"par", 10)],
+    ids=["timeout", "reset", "incomplete"],
+)
+def test_read_phase_failures_are_typed(client, monkeypatch, exc):
+    import meshbook.client as mc
+
+    monkeypatch.setattr(mc, "_urlopen", lambda req, timeout: _BrokenBody(exc))
+    with pytest.raises(MeshbookError) as ei:
+        client.chat.post("x")
+    assert ei.value.code == "network_error" and ei.value.status == 0
+    assert "may or may not have been applied" in ei.value.message  # a write: outcome unknown
+    with pytest.raises(MeshbookError) as ei:
+        client.contacts.list()
+    assert ei.value.code == "network_error"
+    assert "applied" not in ei.value.message  # a read: nothing to warn about
+
+
+def test_raw_oserror_from_urlopen_is_typed(client, monkeypatch):
+    import meshbook.client as mc
+
+    def boom(req, timeout):
+        raise ConnectionAbortedError("aborted")
+
+    monkeypatch.setattr(mc, "_urlopen", boom)
+    with pytest.raises(MeshbookError) as ei:
+        client.contacts.list()
+    assert ei.value.code == "network_error"
+
+
+def test_error_body_cut_off_still_raises_the_status(client, monkeypatch):
+    import io
+    import urllib.error
+
+    import meshbook.client as mc
+
+    class Cut(io.BytesIO):
+        def read(self, *a):
+            raise TimeoutError("mid-body")
+
+    def boom(req, timeout):
+        raise urllib.error.HTTPError(req.get_full_url(), 404, "nf", {}, Cut())
+
+    monkeypatch.setattr(mc, "_urlopen", boom)
+    with pytest.raises(MeshbookError) as ei:
+        client.contacts.list()
+    assert ei.value.status == 404
