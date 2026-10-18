@@ -429,3 +429,36 @@ def test_no_warning_when_env_agrees_or_nothing_is_persisted(tmp_path, monkeypatc
     monkeypatch.delenv("MESHBOOK_MESH")
     assert c.meshes.use("Work", persist=True).env_override is None
     assert not [w for w in recwarn if issubclass(w.category, UserWarning)]
+
+
+# ─── the registry is public for wrappers ───────────────────────────────
+
+
+def test_public_endpoints_module():
+    import meshbook
+    from meshbook import _endpoints, endpoints
+
+    assert meshbook.endpoints is endpoints
+    assert dict(endpoints.ENDPOINTS) == _endpoints.ENDPOINTS
+    assert endpoints.calls() == _endpoints.calls()
+    assert endpoints.path("files.download", attachment_id="a/b") == \
+        "/api/entity-attachments/a%2Fb/download"
+    with pytest.raises(TypeError):
+        endpoints.ENDPOINTS["x"] = endpoints.ENDPOINTS["me"]  # read-only
+    with pytest.raises(KeyError):
+        endpoints.path("files.download")
+
+
+def test_contract_check_accepts_the_public_registry():
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).parent.parent
+    out = subprocess.run(
+        [sys.executable, str(root / "scripts" / "contract_check.py"), "--spec",
+         str(root / "tests" / "contract" / "openapi.json"), "--registry", "meshbook.endpoints"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "OK" in out.stdout

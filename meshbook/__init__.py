@@ -10,7 +10,7 @@ Thin, typed, zero-dependency (stdlib urllib) synchronous client, and since
         print(mesh.name)
     client.tasks.list(mesh="The Tyl Mesh", limit=20)   # per-call mesh override
 """
-from meshbook import config
+from meshbook import config, endpoints
 from meshbook.client import (
     VERSION,
     Client,
@@ -44,6 +44,7 @@ __all__ = [
     "SearchResults",
     "User",
     "config",
+    "endpoints",
     "recurrence_rule",
     "safe_filename",
 ]
