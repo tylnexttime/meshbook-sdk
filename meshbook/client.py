@@ -508,6 +508,10 @@ def _network_message(method: str, path: str, reason: Any, maybe_sent: bool) -> s
     return text
 
 
+def _network_hint(method: str, maybe_sent: bool) -> str:
+    return "check_before_retry" if maybe_sent and method not in ("GET", "HEAD") else "retry_later"
+
+
 def _raise_from_http_error(e: urllib.error.HTTPError) -> None:
     try:
         raw = e.read().decode("utf-8", "replace") if e.fp else "{}"
@@ -868,7 +872,10 @@ class MeshbookClient:
         if not self.token:
             if self.config_error is not None:
                 raise MeshbookError(
-                    self.config_error.code, self.config_error.message, self.config_error.status
+                    self.config_error.code,
+                    self.config_error.message,
+                    self.config_error.status,
+                    hint=self.config_error.hint,
                 )
             raise MeshbookError(
                 "not_authenticated",
@@ -965,14 +972,18 @@ class MeshbookClient:
             except urllib.error.URLError as e:
                 maybe_sent = isinstance(e.reason, (TimeoutError, ConnectionResetError))
                 raise MeshbookError(
-                    "network_error", _network_message(method, path, e.reason, maybe_sent)
+                    "network_error",
+                    _network_message(method, path, e.reason, maybe_sent),
+                    hint=_network_hint(method, maybe_sent),
                 ) from e
             except (OSError, http.client.HTTPException) as e:
                 # Read-phase failures (a timeout mid-body, a reset, a short
                 # read) arrive raw, not wrapped in URLError. The request was
                 # sent, so for a write the outcome is unknown.
                 raise MeshbookError(
-                    "network_error", _network_message(method, path, e, True)
+                    "network_error",
+                    _network_message(method, path, e, True),
+                    hint=_network_hint(method, True),
                 ) from e
             break
         if raw:
@@ -1171,6 +1182,7 @@ class MeshbookClient:
                 "not_authenticated",
                 "/api/me reports authenticated=false — token invalid or revoked.",
                 401,
+                hint="reauthenticate",
             )
         if isinstance(me, dict):
             self._me_cache = me

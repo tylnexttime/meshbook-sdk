@@ -68,6 +68,7 @@ def no_offset(offset: Any, what: str, cursor: str = "limit= and before=") -> Non
         raise MeshbookError(
             "bad_argument",
             f"{what} does not support offset=: the server ignores it and pages by {cursor} only.",
+            hint="use_before_cursor" if "before" in cursor else "fix_argument",
         )
 
 

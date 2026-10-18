@@ -479,7 +479,7 @@ class _Agent(Namespace):
             "before failing, client.agent.recover_pending() promotes it (token() also tries "
             "it automatically)."
         )
-        return MeshbookError(e.code, e.message + note, e.status)
+        return MeshbookError(e.code, e.message + note, e.status, hint="resolve_pending_key")
 
     def _promote_pending(self) -> None:
         """Make the pending key and bundle the live ones (old ones kept as .bak)."""

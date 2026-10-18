@@ -155,10 +155,12 @@ def test_read_phase_failures_are_typed(client, monkeypatch, exc):
         client.chat.post("x")
     assert ei.value.code == "network_error" and ei.value.status == 0
     assert "may or may not have been applied" in ei.value.message  # a write: outcome unknown
+    assert ei.value.hint == "check_before_retry"
     with pytest.raises(MeshbookError) as ei:
         client.contacts.list()
     assert ei.value.code == "network_error"
     assert "applied" not in ei.value.message  # a read: nothing to warn about
+    assert ei.value.hint == "retry_later"
 
 
 def test_raw_oserror_from_urlopen_is_typed(client, monkeypatch):
@@ -256,3 +258,73 @@ def test_me_id_after_whoami_costs_nothing_and_no_user_raises(client, monkeypatch
     with pytest.raises(MeshbookError) as ei:
         client.me_id(refresh=True)
     assert ei.value.code == "no_user"
+
+
+# ─── gap 5: stable codes, machine hints, and a documented list ─────────
+
+
+def _raised_codes():
+    """Every literal code passed to MeshbookError(...) in the package, with
+    any literal hint= given at the raise site."""
+    import ast
+    import pathlib
+
+    import meshbook
+
+    codes, hints = set(), set()
+    for f in pathlib.Path(meshbook.__file__).parent.rglob("*.py"):
+        for n in ast.walk(ast.parse(f.read_text(encoding="utf-8"))):
+            if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "MeshbookError":
+                if n.args and isinstance(n.args[0], ast.Constant):
+                    codes.add(n.args[0].value)
+                for kw in n.keywords:
+                    if kw.arg == "hint":
+                        values = [kw.value]
+                        if isinstance(kw.value, ast.IfExp):  # a if cond else b
+                            values = [kw.value.body, kw.value.orelse]
+                        for v in values:
+                            if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                                hints.add(v.value)
+    return codes, hints
+
+
+def test_every_raised_code_and_hint_is_documented():
+    from pathlib import Path
+
+    from meshbook.errors import HINT_MEANINGS, HINTS, LOCAL_CODES
+
+    codes, site_hints = _raised_codes()
+    assert codes - set(LOCAL_CODES) == set(), "raised but not in LOCAL_CODES"
+    assert set(LOCAL_CODES) == set(HINTS), "every local code has a default hint"
+    assert (set(HINTS.values()) | site_hints) - set(HINT_MEANINGS) == set()
+    readme = (Path(__file__).parent.parent / "README.md").read_text(encoding="utf-8")
+    for code in LOCAL_CODES:
+        assert f"| `{code}` |" in readme, f"{code} missing from the README error table"
+    for hint in HINT_MEANINGS:
+        assert f"| `{hint}` |" in readme, f"hint {hint} missing from the README"
+
+
+def test_hints_carry_no_python_syntax():
+    from meshbook.errors import HINT_MEANINGS
+
+    for hint in HINT_MEANINGS:
+        assert hint.isidentifier() and hint == hint.lower(), hint
+        assert "token" not in hint or hint == "none_needed"
+
+
+def test_hint_defaults_by_code_and_site_overrides(client, monkeypatch):
+    from meshbook.errors import MeshbookError as E
+
+    assert E("file_exists", "x").hint == "allow_overwrite"
+    assert E("whatever_server_code", "x", 401).hint == "reauthenticate"
+    assert E("token_out_of_scope", "x", 403).hint == "choose_permitted_mesh"
+    assert E("forbidden", "x", 403).hint is None
+    assert E("bad_argument", "x", hint="use_before_cursor").hint == "use_before_cursor"
+    install(monkeypatch)
+    with pytest.raises(MeshbookError) as ei:
+        client.chat.list(offset=5)
+    assert ei.value.code == "bad_argument" and ei.value.hint == "use_before_cursor"
+    no_token = MeshbookClient(config_path=client.config_path, mesh=MESH)
+    with pytest.raises(MeshbookError) as ei:
+        no_token.contacts.list()
+    assert (ei.value.code, ei.value.hint) == ("not_authenticated", "provide_credentials")

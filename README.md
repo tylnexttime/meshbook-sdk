@@ -20,8 +20,9 @@ client = Client()                    # token from MESHBOOK_TOKEN or ~/.meshbook/
 print(client.whoami().username)
 ```
 
-Every failure raises a typed `MeshbookError` with `.code`, `.message` and
-`.status` (0 for local and network errors) — no printed noise, no `sys.exit`.
+Every failure raises a typed `MeshbookError` with a stable `.code`, a
+machine `.hint`, a human `.message` and `.status` (0 for local and network
+errors), with no printed noise and no `sys.exit`. See [Errors](#errors).
 
 ## Configuration and environment
 
@@ -212,6 +213,109 @@ own 5-minute tokens for every call, re-mints 30 s before expiry (or on one
 `auth="agent"` never falls back. Keys are written atomically, mode 600 from
 birth; replaced keys are kept as `.bak`. `client.agent.kid_prefix` labels
 which client minted a key.
+
+## Errors
+
+Every failure raises `MeshbookError` with:
+
+- `.code`: a stable machine code. Codes from the server's error envelope
+  (`forbidden`, `not_found`, `token_out_of_scope`, ...) pass through unchanged;
+  the SDK's own codes are listed below (`meshbook.errors.LOCAL_CODES`).
+- `.hint`: a stable machine hint for what to do next (`meshbook.errors.HINTS`
+  gives the default per code; a raise site may be more specific), or `None`.
+  Hints contain no Python syntax, so a CLI or MCP can map them to its own words.
+- `.message`: for a person. Its wording may change between releases: branch on
+  `code` and `hint`, never on the message.
+- `.status`: the HTTP status, or 0 for local and network errors.
+
+A code is never renamed or reused within a minor release; a test checks this
+table against the codes the package actually raises.
+
+| Code | Meaning | Default hint |
+|---|---|---|
+| `api_error` | a 200 body carried ok=false with no code | `check_status` |
+| `bad_agent_key` | the agent private key file cannot be read | `enroll_agent_key` |
+| `bad_argument` | an argument is invalid or unsupported (e.g. offset= where the server pages by before=) | `fix_argument` |
+| `bad_auth` | unknown auth= mode | `fix_argument` |
+| `bad_channel` | empty channel reference | `fix_argument` |
+| `bad_date` | not a date / YYYY-MM-DD | `fix_argument` |
+| `bad_datetime` | not an aware date-time / ISO 8601 string | `add_timezone` |
+| `bad_response` | the server answered with a non-JSON body | `retry_later` |
+| `bad_username` | empty username | `fix_argument` |
+| `channel_not_found` | no channel matches | `check_name` |
+| `config_locked` | another meshbook process holds the config lock | `retry_later` |
+| `config_unreadable` | the config file exists but is not valid; it was left untouched | `fix_config` |
+| `config_write_failed` | the config file or its directory cannot be read or written | `check_permissions` |
+| `contact_ambiguous` | several contacts match | `use_id` |
+| `contact_not_found` | no contact matches | `check_name` |
+| `duplicate_event` | an event with that title already starts then (dedupe guard) | `allow_duplicate` |
+| `empty_file` | the local file to upload is empty | `check_local_path` |
+| `file_exists` | the download target exists; pass overwrite=True to replace it | `allow_overwrite` |
+| `file_not_found` | the local file to upload does not exist | `check_local_path` |
+| `http_error` | an HTTP error with no machine code in the body | `check_status` |
+| `insecure_base` | the base URL is not https (plain http only for localhost) | `fix_base_url` |
+| `key_exists` | an agent key already exists locally; replacing it needs force=True | `confirm_replace_key` |
+| `mesh_ambiguous` | several meshes match the name | `use_id` |
+| `mesh_not_found` | no mesh of yours matches the id or name | `check_name` |
+| `mint_failed` | the token endpoint did not return an access token | `check_agent_key` |
+| `missing_dependency` | the agent lane needs the [agent] extra (cryptography) | `install_agent_extra` |
+| `naive_datetime` | a date-time without a time zone | `add_timezone` |
+| `network_error` | the request or its response was lost on the network | `retry_later` |
+| `no_active_mesh` | the call needs a mesh and none was given or configured | `choose_mesh` |
+| `no_agent_key` | no usable agent key or mint bundle on this machine | `enroll_agent_key` |
+| `no_pending_key` | recover_pending() found no pending key | `none_needed` |
+| `no_pipeline` | the mesh has no pipelines | `create_in_web_app` |
+| `no_stage` | the pipeline has no stages | `create_in_web_app` |
+| `no_user` | authenticated, but /api/me names no user | `check_account` |
+| `not_authenticated` | no usable credential, or the server rejected it | `provide_credentials` |
+| `not_channel_message` | the message is not in a channel or DM | `reply_in_entity_chat` |
+| `not_enrolled` | the server answered 200 without an enrolled bundle | `retry_later` |
+| `pending_key` | an interrupted enroll/register left an unconfirmed key | `resolve_pending_key` |
+| `project_ambiguous` | several projects match | `use_id` |
+| `project_not_found` | no project matches | `check_name` |
+| `redirect_refused` | the server redirected off-origin or redirected a write | `fix_base_url` |
+| `stage_ambiguous` | the stage name exists in several pipelines | `use_id` |
+| `stage_not_found` | no pipeline stage matches | `check_name` |
+| `unsafe_path` | the download would land outside the target directory | `choose_out_path` |
+| `user_ambiguous` | several members match the display name | `use_username` |
+| `user_not_found` | no mesh member matches | `check_name` |
+| `validation_error` | the server's request validation failed (FastAPI 422) | `fix_argument` |
+| `write_failed` | the downloaded file cannot be written | `check_permissions` |
+
+A 401 without a mapped code gets the hint `reauthenticate`;
+`token_out_of_scope` gets `choose_permitted_mesh`.
+
+| Hint | Means |
+|---|---|
+| `add_timezone` | give the date-time a time zone (an offset or tzinfo) |
+| `allow_duplicate` | turn the duplicate guard off for this call if a second one is intended |
+| `allow_overwrite` | allow overwriting the existing file, or choose another path |
+| `check_account` | check the account's state in the web app |
+| `check_agent_key` | check the agent key and its mint bundle |
+| `check_before_retry` | a write may have been applied: check before retrying it |
+| `check_local_path` | check the local file path |
+| `check_name` | check the name or id; the message lists what exists where it can |
+| `check_permissions` | check file permissions and free space |
+| `check_status` | see the HTTP status and message |
+| `choose_mesh` | name a mesh for the call, or set a default mesh |
+| `choose_out_path` | choose another output directory or file name |
+| `choose_permitted_mesh` | use a mesh this token is scoped to |
+| `confirm_replace_key` | confirm that the existing agent key may be replaced |
+| `create_in_web_app` | create the missing item in the web app first |
+| `enroll_agent_key` | enroll or register an agent key |
+| `fix_argument` | correct the argument named in the message |
+| `fix_base_url` | use the https apex base URL |
+| `fix_config` | repair or quarantine the config file named in the message |
+| `install_agent_extra` | install meshbook-sdk[agent] |
+| `none_needed` | nothing to do |
+| `provide_credentials` | supply an API token or sign in |
+| `reauthenticate` | the credential was rejected: sign in again or mint a new token |
+| `reply_in_entity_chat` | reply through entity chat, not a channel |
+| `resolve_pending_key` | recover or discard the pending agent key |
+| `retry_later` | retry after a short wait |
+| `use_before_cursor` | page with limit and before (no offset on this route) |
+| `use_id` | refer to it by id instead of name |
+| `use_username` | refer to the member by @username |
 
 ## Contract check
 
