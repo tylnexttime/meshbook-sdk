@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import http.client
 import json
 import os
 import tempfile
@@ -690,6 +691,9 @@ class _Agent(Namespace):
             raise  # unreachable
         except urllib.error.URLError as e:
             raise MeshbookError("network_error", str(e.reason)) from e
+        except (OSError, http.client.HTTPException) as e:
+            # Read-phase failure (critique C-16): typed, never raw.
+            raise MeshbookError("network_error", f"token endpoint: {e or type(e).__name__}") from e
 
         # Neither branch below quotes the body: a 200 from this endpoint is
         # credential-bearing by construction (scope=openid ⇒ id_token), even

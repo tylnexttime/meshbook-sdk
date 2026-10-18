@@ -880,3 +880,26 @@ def test_rotation_assertion_is_not_signed_by_the_incoming_key(agent_client, monk
     body = t.last_body()
     with pytest.raises((InvalidSignature, AssertionError)):
         _rotation_claims(body, body)   # verify against the NEW key instead
+
+
+def test_agent_token_mint_read_failure_is_typed(agent_client, monkeypatch, tmp_path):
+    """Critique C-16 in the agent lane: a reset while reading the token
+    endpoint's response escaped as a raw ConnectionResetError."""
+
+    class Broken:
+        headers: dict = {}
+
+        def read(self):
+            raise ConnectionResetError("reset mid-body")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    _seed_identity(tmp_path)
+    monkeypatch.setattr(mc, "_urlopen", lambda req, timeout: Broken())
+    with pytest.raises(MeshbookError) as ei:
+        agent_client.agent.token()
+    assert ei.value.code == "network_error"

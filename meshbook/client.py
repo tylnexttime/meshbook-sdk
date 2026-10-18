@@ -198,8 +198,81 @@ def _is_uuid(value: str) -> bool:
 # through `_sleep` so tests can record them instead of waiting.
 
 
+def _origin(url: str) -> tuple[str, str, int | None]:
+    parts = urllib.parse.urlsplit(url)
+    scheme = parts.scheme.lower()
+    port = parts.port or {"https": 443, "http": 80}.get(scheme)
+    return scheme, (parts.hostname or "").lower(), port
+
+
+class _RedirectGuard(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only when it is safe to.
+
+    CPython's stock handler copies every header (Authorization and
+    X-Active-Mesh-Id included) to ANY Location, and turns a redirected POST
+    into a bodiless GET, so ``base="https://www.meshbook.org"`` made
+    ``tasks.create`` return a list and create nothing. Here a redirect is
+    followed only for GET/HEAD to the SAME origin (scheme, host, port);
+    anything else raises ``redirect_refused`` naming the Location.
+    """
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        method = req.get_method()
+        target = urllib.parse.urljoin(req.full_url, newurl)
+        if method not in ("GET", "HEAD") or _origin(target) != _origin(req.full_url):
+            try:
+                fp.close()
+            except Exception:
+                pass
+            path = urllib.parse.urlsplit(req.full_url).path
+            raise MeshbookError(
+                "redirect_refused",
+                f"{method} {path} was redirected ({code}) to {target}; not followed (a "
+                "redirect may only stay on the same origin, and only for GET/HEAD). "
+                "Check the base URL: meshbook is served from the apex https://meshbook.org.",
+                code,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(_RedirectGuard)
+
+
 def _urlopen(req: urllib.request.Request, timeout: float) -> Any:
-    return urllib.request.urlopen(req, timeout=timeout)  # noqa: S310
+    return _opener.open(req, timeout=timeout)
+
+
+#: Hosts a plain-http base may name (local development only).
+_LOOPBACK = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _check_base(base: str) -> str:
+    """The base URL, stripped of a trailing slash, or ``insecure_base``.
+
+    https is required: the bearer rides on every request. Plain http is
+    allowed only for a loopback host (``localhost``, ``127.0.0.1``,
+    ``::1``, ``*.localhost``), i.e. a dev server on this machine.
+    """
+    clean = base.strip().rstrip("/")
+    parts = urllib.parse.urlsplit(clean)
+    host = (parts.hostname or "").lower()
+    if not host or parts.scheme.lower() not in ("https", "http"):
+        raise MeshbookError("insecure_base", f"Base URL {base!r} is not an http(s) URL.")
+    if parts.scheme.lower() == "http" and not (host in _LOOPBACK or host.endswith(".localhost")):
+        raise MeshbookError(
+            "insecure_base",
+            f"Base URL {base!r} is plain http: the API token would cross the network "
+            "unencrypted. Use https (plain http is allowed only for localhost).",
+        )
+    return clean
 
 
 def _sleep(seconds: float) -> None:
@@ -572,7 +645,7 @@ class MeshbookClient:
 
         cfg_base = cfg.get("base") if isinstance(cfg.get("base"), str) else None
         resolved_base = base or os.environ.get("MESHBOOK_BASE") or cfg_base or DEFAULT_BASE
-        self.base = resolved_base.rstrip("/")
+        self.base = _check_base(resolved_base)
 
         # ── mesh precedence: Client(mesh/active_mesh_id) > env > config ──
         if mesh and active_mesh_id and mesh != active_mesh_id:
