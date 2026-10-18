@@ -47,3 +47,7 @@ Dockerfile  text eol=lf
 *.sqlite    binary
 *.woff      binary
 *.woff2     binary
+
+# The pinned OpenAPI snapshot is byte-exact: its sha256 is recorded in
+# openapi.source.json, so line endings must never be rewritten.
+tests/contract/openapi.json -text
