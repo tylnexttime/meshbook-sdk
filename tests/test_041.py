@@ -328,3 +328,33 @@ def test_hint_defaults_by_code_and_site_overrides(client, monkeypatch):
     with pytest.raises(MeshbookError) as ei:
         no_token.contacts.list()
     assert (ei.value.code, ei.value.hint) == ("not_authenticated", "provide_credentials")
+
+
+# ─── gap 6: ItemList.total_exact ───────────────────────────────────────
+
+
+def test_total_exact_follows_the_server_paging_envelope(client, monkeypatch):
+    r = install(monkeypatch)
+    r.add("GET", "/api/contacts", ok_list([{"id": 1}], total=57, limit=1, offset=0))
+    rows = client.contacts.list(limit=1)
+    assert rows.total == 57 and rows.total_exact is True and rows.has_more
+    r.add("GET", "/api/companies", ok_list([{"id": 1}, {"id": 2}]))  # old server: page length
+    rows = client.companies.list(limit=2)
+    assert rows.total == 2 and rows.total_exact is False
+    r.add("GET", "/api/tags", ok_list([{"id": i} for i in range(10)]))  # ignores paging
+    rows = client.tags.list(limit=3, offset=3)
+    assert rows.total == 10 and rows.total_exact is True  # every row was sent
+    r.add("GET", f"/api/meshes/{MESH}/channels", {"ok": True, "data": [{"id": "c"}]})
+    assert client.channels.list().total_exact is False  # bare list: no total at all
+
+
+def test_total_exact_survives_the_typed_and_sorted_copies(client, monkeypatch):
+    r = install(monkeypatch)
+    r.add("GET", "/api/tasks", ok_list([{"id": "a", "title": "b"}, {"id": "b", "title": "a"}],
+                                       total=9, limit=2, offset=0))
+    assert client.tasks.list(limit=2, sort="title").total_exact is True
+    r.add("GET", f"/api/meshes/{MESH}/exports", ok_list([{"id": "x"}], total=1, limit=50,
+                                                        offset=0))
+    assert client.exports.list().total_exact is True
+    r.add("GET", "/api/meshes", ok_list([{"id": MESH, "name": "m"}], total=1, limit=50, offset=0))
+    assert client.meshes.list_mine().total_exact is True

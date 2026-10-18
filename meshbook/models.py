@@ -14,6 +14,10 @@ from typing import Any, Generic, NamedTuple, SupportsIndex, TypeVar, overload
 T = TypeVar("T")
 
 
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 class ItemList(list[T], Generic[T]):
     """A list result, with the server's pagination envelope kept.
 
@@ -24,7 +28,13 @@ class ItemList(list[T], Generic[T]):
     Attributes:
         total:  the server's ``total`` (``None`` when the endpoint returns a
                 bare list). Many endpoints report the PAGE length here, not
-                the full count — so ``has_more`` is the honest signal.
+                the full count; :attr:`total_exact` says which you have.
+        total_exact: True when ``total`` is known to be the full count: the
+                server sent its paging (``limit`` and ``offset``) alongside
+                ``total`` (the 2026-10-19 ``ok_page`` shape), or the server
+                sent every row and the client paged them itself. False
+                otherwise: ``total`` may be the page length, and
+                ``has_more`` is the honest signal.
         limit:  the ``limit`` this call asked for (``None`` if it sent none).
         offset: the ``offset`` this call asked for (``None`` if it sent none).
         meta:   any other envelope keys (``page``, ``pageSize``,
@@ -35,6 +45,7 @@ class ItemList(list[T], Generic[T]):
     limit: int | None
     offset: int | None
     meta: dict[str, Any]
+    total_exact: bool
 
     def __init__(
         self,
@@ -44,12 +55,20 @@ class ItemList(list[T], Generic[T]):
         limit: int | None = None,
         offset: int | None = None,
         meta: dict[str, Any] | None = None,
+        total_exact: bool | None = None,
     ) -> None:
         super().__init__(items)
         self.total = total
         self.limit = limit
         self.offset = offset
         self.meta = dict(meta or {})
+        if total_exact is None:
+            total_exact = (
+                total is not None
+                and _is_int(self.meta.get("limit"))
+                and _is_int(self.meta.get("offset"))
+            )
+        self.total_exact = bool(total_exact) and total is not None
 
     @property
     def truncated(self) -> bool:
@@ -73,7 +92,7 @@ class ItemList(list[T], Generic[T]):
     def __repr__(self) -> str:
         return (
             f"ItemList({list.__repr__(self)}, total={self.total!r}, "
-            f"limit={self.limit!r}, offset={self.offset!r})"
+            f"limit={self.limit!r}, offset={self.offset!r}, total_exact={self.total_exact!r})"
         )
 
 

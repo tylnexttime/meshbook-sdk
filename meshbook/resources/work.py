@@ -215,7 +215,12 @@ class Tasks(Namespace):
         if sort:
             ordered = _sort_tasks(list(rows), sort)
             return ItemList(
-                ordered, total=rows.total, limit=rows.limit, offset=rows.offset, meta=rows.meta
+                ordered,
+                total=rows.total,
+                limit=rows.limit,
+                offset=rows.offset,
+                meta=rows.meta,
+                total_exact=rows.total_exact,
             )
         return rows
 

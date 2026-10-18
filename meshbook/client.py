@@ -157,13 +157,15 @@ def _item_list(
     else:
         items = data
     rows = list(items) if isinstance(items, list) else []
+    exact: bool | None = None  # None: ItemList decides from the server's meta
     if limit is not None and len(rows) > limit:
         start = offset or 0
         if total is None or total == len(rows):
             total = len(rows)
+            exact = True  # the server sent every row: the count is the count
         rows = rows[start : start + limit]
         meta["client_paginated"] = True
-    return cls(rows, total=total, limit=limit, offset=offset, meta=meta)
+    return cls(rows, total=total, limit=limit, offset=offset, meta=meta, total_exact=exact)
 
 
 def _items(payload: Any) -> ItemList[Any]:

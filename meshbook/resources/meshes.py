@@ -27,6 +27,7 @@ class Meshes(Namespace):
             limit=rows.limit,
             offset=rows.offset,
             meta=rows.meta,
+            total_exact=rows.total_exact,
         )
         if limit is None and offset is None:
             self._c._meshes_cache = list(out)

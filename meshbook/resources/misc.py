@@ -179,6 +179,7 @@ class Exports(Namespace):
             limit=rows.limit,
             offset=rows.offset,
             meta=rows.meta,
+            total_exact=rows.total_exact,
         )
 
     def download(
