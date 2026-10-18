@@ -38,8 +38,10 @@ response and persisted; it is never hardcoded.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -48,7 +50,11 @@ from pathlib import Path
 from typing import Any
 
 from . import client as _client
-from .client import USER_AGENT, MeshbookError, User, _data, _Namespace
+from . import config as _config
+from .client import _data
+from .errors import MeshbookError
+from .models import User
+from .resources._base import Namespace
 
 # ─── constants ─────────────────────────────────────────────────────────
 
@@ -59,9 +65,10 @@ REGISTRATION_AUD = "meshbook-agent-registration"
 # across purposes.
 ROTATION_AUD = "meshbook-agent-rotation"
 
-#: Forensic label on every key this SDK enrolls (the CLI uses
-#: "mesh-agent-", the MCP "mcp-agent-"). The server never parses a kid —
-#: it is copied opaquely into the per-agent Authentik source — so the
+#: Default forensic label on every key this SDK enrolls. meshbook-cli
+#: uses "mesh-agent-" and meshbook-mcp "mcp-agent-" — set
+#: ``client.agent.kid_prefix`` to keep yours. The server never parses a kid
+#: (it is copied opaquely into the per-agent Authentik source), so the
 #: prefix exists purely to say which client minted the key.
 KID_PREFIX = "sdk-agent-"
 
@@ -84,27 +91,22 @@ _MISSING_CRYPTO = (
     "pip install meshbook-sdk[agent]"
 )
 
-# Why every call in this module passes send_active_mesh=False.
+# Why no call in this module sends X-Active-Mesh-Id.
 #
 # None of the four agent endpoints takes an ActiveMeshDep server-side, so
-# X-Active-Mesh-Id is irrelevant to all of them — but "irrelevant" is not
+# the header is irrelevant to all of them — but "irrelevant" is not
 # "harmless". app/middleware.py runs the §21d mesh-scope gate on EVERY
 # request whose auth_method is "api_token" and whose token carries
 # scope_meshes: if the header names a mesh outside that scope it answers
 # 403 token_out_of_scope BEFORE the route runs, whatever the route is.
 #
-# This SDK reads active_mesh_id out of the CLI config file by default, so
-# a caller holding a mesh-scoped mb_token_ and a stale ~/.meshbook/config
-# would get a 403 on enroll() that has nothing to do with enrolling —
-# the Wren A3/A5 failure both client specs told this SDK not to reproduce.
-# An SDK's agent calls must not inherit an active-mesh header they did not
-# ask for.
-#
-# The three bearer-lane verbs (enroll/status/revoke) are where this bites;
-# whoami() authenticates with an agent JWT, for which auth_method is
-# "agent_jwt" and the scope gate never executes, so suppressing it there
-# is hygiene rather than a fix. register() gets it for free via
-# require_auth=False.
+# A caller holding a mesh-scoped mb_token_ and a stale ~/.meshbook/config
+# would get a 403 on enroll() that has nothing to do with enrolling — the
+# Wren A3/A5 failure. So the endpoint registry marks every agent route
+# mesh="none" (meshbook/_endpoints.py), and whoami() goes through the
+# "me" entry, which is mesh="none" too. meshbook-cli sent the header on
+# status/revoke/whoami; that difference is resolved here in favour of
+# never sending it.
 
 
 # ─── crypto helpers (every cryptography import is lazy) ────────────────
@@ -115,7 +117,7 @@ def _b64u(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
-def _crypto():
+def _crypto() -> tuple[Any, Any, Any, Any]:
     """Import the optional ``cryptography`` extra, or explain how to get it."""
     try:
         from cryptography.hazmat.primitives import hashes, serialization
@@ -125,7 +127,7 @@ def _crypto():
     return hashes, serialization, padding, rsa
 
 
-def _new_key() -> tuple[Any, dict]:
+def _new_key() -> tuple[Any, dict[str, Any]]:
     """Generate an RSA-2048 keypair; return ``(private_key, public_jwk)``.
 
     The JWK is exactly what the server keeps: it normalises every
@@ -149,7 +151,7 @@ def _new_key() -> tuple[Any, dict]:
     return key, jwk
 
 
-def _claims(username: str, aud: str, jti_prefix: str = "") -> dict:
+def _claims(username: str, aud: str, jti_prefix: str = "") -> dict[str, Any]:
     """The claim set both assertions share; only ``aud`` and ``jti`` differ."""
     now = int(time.time())
     return {
@@ -162,7 +164,7 @@ def _claims(username: str, aud: str, jti_prefix: str = "") -> dict:
     }
 
 
-def _sign(claims: dict, kid: str, key: Any) -> str:
+def _sign(claims: dict[str, Any], kid: str, key: Any) -> str:
     """Compact RS256 JWT — PKCS1v15 + SHA256 over the bytes we actually emit.
 
     The signature covers ``b64u(header) + "." + b64u(claims)`` exactly as
@@ -231,8 +233,55 @@ def _raise_from_token_error(e: urllib.error.HTTPError) -> None:
 # ─── namespace ─────────────────────────────────────────────────────────
 
 
-class _Agent(_Namespace):
-    """``client.agent`` — the §97/§86/§93 non-human lane.
+def _jwt_exp(token: str) -> float | None:
+    """The ``exp`` claim of a compact JWT, or None when it is not one.
+
+    Read WITHOUT verifying (we only use it to decide when to re-mint; the
+    server verifies). meshbook-cli and meshbook-mcp trusted this claim
+    alone; this SDK trusted ``expires_in`` alone. The lane now takes the
+    EARLIER of the two, so a token is never held past either deadline.
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(payload)).get("exp")
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return float(exp) if isinstance(exp, (int, float)) and not isinstance(exp, bool) else None
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    """Atomically write *data* to *path*, mode 600 on POSIX from the first byte.
+
+    The three earlier implementations all did ``write_bytes`` then
+    ``chmod``, leaving the private key world-readable (umask 022) for the
+    moment in between, and a half-written key if the process died mid-write.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            with contextlib.suppress(OSError):
+                os.fsync(fh.fileno())
+        if os.name == "posix":
+            with contextlib.suppress(OSError):
+                os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
+
+
+class _Agent(Namespace):
+    """``client.agent`` — the §97/§86/§93/§99 non-human lane.
 
     Two ways in:
 
@@ -240,12 +289,23 @@ class _Agent(_Namespace):
       bearer needed: possession of the private key IS the authentication.
       Lands in the lobby (zero mesh memberships).
     * :meth:`enroll` — attach a key to an account you can already
-      authenticate as (an ``mb_token_`` bearer, non-human seats only).
+      authenticate as (an ``mb_token_`` bearer, non-human seats only; or,
+      for a rotation, the agent lane itself with a §99 proof).
 
-    Either one leaves a private key and a mint bundle on disk. After
-    that, :meth:`token` mints 5-minute access tokens on demand, and
-    ``MeshbookClient(auth="agent")`` uses them for every call.
+    Either one leaves a private key and a mint bundle on disk. After that,
+    :meth:`token` mints 5-minute access tokens on demand, and
+    ``MeshbookClient(auth="agent")`` — or a config with ``auth_mode:
+    "agent"`` — uses them for every call, re-minting once on a 401.
+
+    This is the one implementation of the lane: meshbook-cli's
+    ``mesh/agent.py`` and meshbook-mcp's inline copy are replaced by it.
+    ``kid_prefix`` lets each client keep its forensic label
+    (``mesh-agent-``, ``mcp-agent-``).
     """
+
+    def __init__(self, client: Any) -> None:
+        super().__init__(client)
+        self.kid_prefix = KID_PREFIX
 
     # ── local key material ────────────────────────────────────────────
 
@@ -260,20 +320,32 @@ class _Agent(_Namespace):
         """The mint bundle beside the key — ``agent-key.json`` by default."""
         return self.key_path.with_suffix(".json")
 
-    def local_meta(self) -> dict:
+    def local_meta(self) -> dict[str, Any]:
         """The persisted mint bundle ({kid, tokenEndpoint, audience,
         clientId, username}), or ``{}`` when nothing is enrolled locally.
 
         Comparing ``local_meta()["kid"]`` against ``status()["kid"]`` is
         the real health check: the server can hold a kid whose private
-        half you no longer have (someone re-enrolled elsewhere), and
-        neither reference client ever notices.
+        half you no longer have (someone re-enrolled elsewhere).
         """
         try:
-            loaded = json.loads(self.meta_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            loaded = json.loads(self.meta_path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
             return {}
         return loaded if isinstance(loaded, dict) else {}
+
+    def ready(self) -> bool:
+        """Is the lane materially possible on this machine — a private key
+        on disk AND a bundle naming its kid? (What ``mesh doctor`` reports;
+        no network, no crypto.)"""
+        return self.key_path.exists() and bool(self.local_meta().get("kid"))
+
+    def _fresh_key(self) -> tuple[Any, dict[str, Any]]:
+        """A new keypair whose kid carries this client's forensic prefix."""
+        key, jwk = _new_key()
+        if self.kid_prefix != KID_PREFIX and jwk["kid"].startswith(KID_PREFIX):
+            jwk["kid"] = self.kid_prefix + jwk["kid"][len(KID_PREFIX) :]
+        return key, jwk
 
     def _guard_local_key(self, force: bool, verb: str) -> None:
         if force or not self.key_path.exists():
@@ -286,45 +358,49 @@ class _Agent(_Namespace):
             "agent_key_path= at another file.",
         )
 
-    def _persist(self, key: Any, data: dict) -> None:
-        """Write the private key (PKCS#8 PEM, unencrypted) and the mint bundle.
+    def _backup_existing(self) -> None:
+        """Keep one ``.bak`` generation of the outgoing key and bundle."""
+        for p in (self.key_path, self.meta_path):
+            if p.exists():
+                with contextlib.suppress(OSError):
+                    p.replace(p.with_suffix(p.suffix + ".bak"))
 
-        Byte-compatible with ``mesh agent enroll`` so the CLI can mint off
-        an SDK-enrolled key and vice versa: same two filenames, same five
-        bundle keys, ``audience`` populated from ``assertionAud`` first
-        (the server sends both with the same value today; the duplication
-        exists so they can diverge later).
+    def _persist(self, key: Any, data: dict[str, Any], local_kid: str | None = None) -> None:
+        """Write the private key (PKCS#8 PEM, unencrypted, mode 600 from
+        birth, atomically) and the mint bundle.
+
+        Byte-compatible with every earlier meshbook client: same two
+        filenames, same five bundle keys, ``audience`` from
+        ``assertionAud`` first. ``kid`` is the server's echo (what it knows
+        the key by), falling back to the locally generated kid when the
+        server does not echo one.
         """
         _hashes, serialization, _padding, _rsa = _crypto()
-        key_path = self.key_path
-        key_path.parent.mkdir(parents=True, exist_ok=True)
-        key_path.write_bytes(
+        _write_private(
+            self.key_path,
             key.private_bytes(
                 serialization.Encoding.PEM,
                 serialization.PrivateFormat.PKCS8,
                 serialization.NoEncryption(),
-            )
+            ),
         )
-        if os.name == "posix":
-            # No equivalent on Windows: the key inherits directory ACLs.
-            try:
-                os.chmod(key_path, 0o600)
-            except OSError:
-                pass
         meta = {
-            "kid": data.get("kid"),
+            "kid": data.get("kid") or local_kid,
             "tokenEndpoint": data.get("tokenEndpoint"),
             "audience": data.get("assertionAud") or data.get("audience"),
             "clientId": data.get("clientId"),
             "username": data.get("username"),
         }
-        self.meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        _write_private(self.meta_path, json.dumps(meta, indent=2).encode("utf-8"))
         self._forget_token()
 
     def _forget_token(self) -> None:
         """Drop any cached access token — it belongs to the previous key."""
         self._c._agent_token = None
         self._c._agent_token_expires_at = 0.0
+
+    def _persist_auth_mode(self, mode: str | None) -> None:
+        _config.save_config({"auth_mode": mode}, self._c.config_path)
 
     # ── the lane ──────────────────────────────────────────────────────
 
@@ -336,7 +412,9 @@ class _Agent(_Namespace):
         pronouns: str | None = None,
         pronouns_custom: str | None = None,
         force: bool = False,
-    ) -> dict:
+        *,
+        persist: bool = False,
+    ) -> dict[str, Any]:
         """POST /api/register/agent — §97 self-registration, unauthenticated.
 
         Mints a keypair locally, proves possession of the private half with
@@ -344,28 +422,32 @@ class _Agent(_Namespace):
         zero mesh memberships (the lobby) plus the mint bundle.
 
         ``username`` is normalised to ``strip().lower()`` BEFORE it is
-        signed. This is not cosmetic: the server lowercases the body field
-        and then compares it against the assertion's raw ``sub``, so
-        signing ``"Wanderer"`` returns a ``bad_assertion`` that says nothing
-        about casing.
+        signed: the server lowercases the body field and then compares it
+        against the assertion's raw ``sub``, so signing ``"Wanderer"``
+        returns a ``bad_assertion`` that says nothing about casing.
 
-        ``pronouns`` / ``pronouns_custom`` are accepted by the server and
-        sent by neither reference client, so a seat registered through the
-        CLI or MCP cannot declare pronouns at birth. This SDK can.
+        ``force=True`` replaces an existing local key — which stops the
+        identity it belonged to from minting — and keeps it as ``.bak``
+        (neither earlier client kept a copy on this path).
+
+        ``persist=True`` also writes ``auth_mode: "agent"`` to the config
+        (what ``mesh agent register`` and the MCP's ``register_agent`` do:
+        a fresh seat has no bearer, so the key IS its login) and switches
+        this client to the agent lane.
 
         Returns the register bundle: ``enrolled``, ``username``, ``kid``,
         ``tokenEndpoint``, ``clientId``, ``audience``, ``assertionAud``,
-        ``tokenLifetimeSeconds``, ``user_id`` (the one snake_case key on
-        the surface — do not "normalise" it) and ``lobby``.
+        ``tokenLifetimeSeconds``, ``user_id`` (snake_case — do not
+        "normalise" it) and ``lobby``.
         """
         handle = username.strip().lower()
         if not handle:
             raise MeshbookError("bad_username", "Username is empty.")
         self._guard_local_key(force, "registering")
 
-        key, jwk = _new_key()
+        key, jwk = self._fresh_key()
         assertion = _sign(_claims(handle, REGISTRATION_AUD, "reg-"), jwk["kid"], key)
-        body: dict = {"username": handle, "publicKey": jwk, "assertion": assertion}
+        body: dict[str, Any] = {"username": handle, "publicKey": jwk, "assertion": assertion}
         if display_name and display_name.strip():
             body["displayName"] = display_name.strip()
         if substrate and substrate.strip():
@@ -375,15 +457,19 @@ class _Agent(_Namespace):
         if pronouns_custom and pronouns_custom.strip():
             body["pronounsCustom"] = pronouns_custom.strip()
 
-        # require_auth=False also suppresses X-Active-Mesh-Id: an endpoint
-        # for callers who do not exist yet has no business carrying the
-        # active mesh of whatever config dir was inherited.
-        data = _data(self._c.request("POST", "/api/register/agent", body=body, require_auth=False))
+        # Unauthenticated, so no X-Active-Mesh-Id either: an endpoint for
+        # callers who do not exist yet has no business carrying the active
+        # mesh of whatever config dir was inherited.
+        data = _data(self._c._call("agent.register", body=body))
         self._check_bundle(data, "Registration")
-        self._persist(key, data)
+        self._backup_existing()
+        self._persist(key, data, jwk["kid"])
+        if persist:
+            self._persist_auth_mode("agent")
+            self._c.auth = "agent"
         return data
 
-    def enroll(self, force: bool = False) -> dict:
+    def enroll(self, force: bool = False, *, persist: bool = False) -> dict[str, Any]:
         """POST /api/me/agent-credentials — §86, register a key against the
         account this client is already authenticated as.
 
@@ -393,21 +479,24 @@ class _Agent(_Namespace):
 
         **One key per member.** The per-agent source's JWKS is SET to this
         key, never appended, so re-enrolling instantly kills the previous
-        one — hence ``force``, which the MCP's version of this call lacks
-        and which is the difference between rotating a key and destroying
-        an identity's only credential.
-
-        Returns the §86 bundle (no ``user_id``, no ``lobby``).
+        one — hence ``force``, which the MCP's version of this call lacked:
+        the difference between rotating a key and destroying an identity's
+        only credential.
 
         **Rotation (§99):** when a local key already exists (``force=True``
         over one), the request carries ``rotationAssertion`` — a JWT signed
         by the OUTGOING key, aud ``meshbook-agent-rotation``, bound to the
         new key's kid. On the bearer lane the server ignores it; on the
-        agent-JWT lane (``auth="agent"``) it is REQUIRED, because a
-        5-minute access token alone must never be able to replace the
-        seat's root key. Without this, an ``auth="agent"`` client could
-        never rotate its own key. The outgoing key/meta are kept as
-        ``.bak`` beside the new ones.
+        agent-JWT lane it is REQUIRED, because a 5-minute access token alone
+        must never be able to replace the seat's root key. The proof is
+        signed before anything on disk changes; the outgoing key/meta are
+        kept as ``.bak``.
+
+        ``persist=True`` also writes ``auth_mode: "agent"`` to the config
+        (enrolling makes the key the everyday login, as ``mesh agent
+        enroll`` and the MCP's tool do) and switches this client over.
+
+        Returns the §86 bundle (no ``user_id``, no ``lobby``).
         """
         self._guard_local_key(force, "enrolling")
         rotation_key = None
@@ -420,80 +509,63 @@ class _Agent(_Namespace):
                     rotation_key = serialization.load_pem_private_key(
                         self.key_path.read_bytes(), password=None
                     )
-                    rotation_sub = (old_meta["username"], old_meta["kid"])
-                except (OSError, ValueError):
-                    rotation_key = None   # unreadable old key — enroll bare
-        key, jwk = _new_key()
-        body: dict = {"publicKey": jwk}
+                    rotation_sub = (str(old_meta["username"]), str(old_meta["kid"]))
+                except (OSError, ValueError, TypeError):
+                    rotation_key = None  # unreadable old key — enroll bare
+        key, jwk = self._fresh_key()
+        body: dict[str, Any] = {"publicKey": jwk}
         if rotation_key is not None and rotation_sub is not None:
             username, old_kid = rotation_sub
             claims = _claims(username, ROTATION_AUD, "rot-")
             claims["new_kid"] = jwk["kid"]
             body["rotationAssertion"] = _sign(claims, old_kid, rotation_key)
-        # send_active_mesh=False — see the mesh-scope note at the top of this module.
-        data = _data(
-            self._c.request(
-                "POST",
-                "/api/me/agent-credentials",
-                body=body,
-                send_active_mesh=False,
-            )
-        )
+        data = _data(self._c._call("agent.enroll", body=body))
         self._check_bundle(data, "Enrollment")
         # Keep one .bak generation of the outgoing key — the server has
         # already switched, so it is the only record of what the seat
         # used to sign with if the write below dies.
-        for p in (self.key_path, self.meta_path):
-            if p.exists():
-                try:
-                    p.replace(p.with_suffix(p.suffix + ".bak"))
-                except OSError:
-                    pass
-        self._persist(key, data)
+        self._backup_existing()
+        self._persist(key, data, jwk["kid"])
+        if persist:
+            self._persist_auth_mode("agent")
+            self._c.auth = "agent"
         return data
 
-    def status(self) -> dict:
+    def status(self) -> dict[str, Any]:
         """GET /api/me/agent-credentials — ``{enrolled, username, kid?}``.
 
         SERVER-side truth: whether the per-agent Authentik source holds a
-        key, not whether this machine has one. ``kid`` is ABSENT (not
-        null) when no source exists, so read it with ``.get()``. Compare
-        it against :meth:`local_meta` to catch the case the reference
-        clients never check — enrolled, but with someone else's key.
+        key, not whether this machine has one. ``kid`` is ABSENT (not null)
+        when no source exists, so read it with ``.get()``. Compare it
+        against :meth:`local_meta` to catch "enrolled, but with someone
+        else's key". Sends no X-Active-Mesh-Id (see the module docstring).
         """
-        # Deliberately NOT ``self._c._get_data(...)``: that helper always
-        # sends the active mesh, and this endpoint must not. See the
-        # mesh-scope note at the top of this module.
-        data = _data(
-            self._c.request("GET", "/api/me/agent-credentials", send_active_mesh=False)
-        )
+        data = _data(self._c._call("agent.status"))
         return data if isinstance(data, dict) else {}
 
-    def revoke(self, purge_local: bool = False) -> dict:
+    def revoke(self, purge_local: bool = False, *, persist: bool = False) -> dict[str, Any]:
         """DELETE /api/me/agent-credentials — delete the per-agent source.
 
-        Terminal and idempotent: ``revoked: true`` comes back whether or
-        not anything existed. There is no per-token revocation — already
-        minted access tokens stay valid until they expire (~5 min), and
-        that short lifetime IS the security parameter.
+        Terminal and idempotent: ``revoked: true`` comes back whether or not
+        anything existed. Already-minted access tokens stay valid until they
+        expire (~5 min); that short lifetime IS the security parameter.
 
-        ``purge_local=True`` also unlinks the private key and the mint
-        bundle. Without it they stay on disk and every later mint fails at
-        the token endpoint, because the source behind them is gone.
+        ``purge_local=True`` also unlinks the private key and the bundle.
+        ``persist=True`` clears ``auth_mode`` from the config (with no
+        mintable key the lane is dead — what both earlier clients did) and
+        switches this client back to the bearer lane; check ``client.token``
+        afterwards — None means the bench has no working auth at all.
         """
-        # send_active_mesh=False — see the mesh-scope note at the top of this module.
-        data = _data(
-            self._c.request(
-                "DELETE", "/api/me/agent-credentials", send_active_mesh=False
-            )
-        )
+        data = _data(self._c._call("agent.revoke"))
         self._forget_token()
         if purge_local:
             for path in (self.key_path, self.meta_path):
-                try:
+                with contextlib.suppress(FileNotFoundError):
                     path.unlink()
-                except FileNotFoundError:
-                    pass
+        if persist:
+            self._persist_auth_mode(None)
+            self._c.auth = "bearer"
+            self._c._agent_fallback = False
         return data if isinstance(data, dict) else {}
 
     def token(self, force: bool = False) -> str:
@@ -506,11 +578,10 @@ class _Agent(_Namespace):
         different host from the meshbook base, so ``base=`` does not
         redirect it. Follow the bundle; do not hardcode either value.
 
-        The token is cached on the client and re-minted once it is within
-        30s of expiry, so a call never goes out holding a token that dies
-        mid-flight. Lifetime comes from the token response's
-        ``expires_in``, falling back to 300s. ``force=True`` mints a fresh
-        one regardless.
+        Cached on the client and re-minted once within 30 s of expiry. The
+        lifetime is the EARLIER of the response's ``expires_in`` and the
+        token's own ``exp`` claim, falling back to 300 s. ``force=True``
+        mints a fresh one regardless (``mesh agent token``).
         """
         cached = self._c._agent_token
         if not force and cached and time.time() < self._c._agent_token_expires_at - _REMINT_SKEW:
@@ -525,18 +596,14 @@ class _Agent(_Namespace):
 
         Proves the whole lane end to end, which :meth:`status` cannot:
         status answers "do I hold a key", this answers "and who does that
-        key make me". Note ``/api/me`` NEVER 401s — an unmappable bearer
-        gets 200 with ``{"authenticated": false}`` and no ``user`` key, so
-        this asserts on the body, not the status line. The active-mesh
-        header is deliberately not sent: an identity probe should not
-        inherit a mesh it never asked for.
+        key make me". ``/api/me`` NEVER 401s — an unmappable bearer gets 200
+        with ``{"authenticated": false}`` and no ``user``, so this asserts
+        on the body, not the status line. No active-mesh header: an
+        identity probe should not inherit a mesh it never asked for.
         """
-        payload = self._c.request(
-            "GET", "/api/me", token=self.token(), send_active_mesh=False
-        )
-        data = _data(payload)
-        user = (data or {}).get("user") if isinstance(data, dict) else None
-        if not user:
+        data = _data(self._c._call("me", token=self.token()))
+        user = data.get("user") if isinstance(data, dict) else None
+        if not user or (isinstance(data, dict) and data.get("authenticated") is False):
             raise MeshbookError(
                 "not_authenticated",
                 "The minted agent token did not resolve to a user. meshbook maps an agent "
@@ -549,13 +616,13 @@ class _Agent(_Namespace):
     # ── internals ─────────────────────────────────────────────────────
 
     def _check_bundle(self, data: Any, what: str) -> None:
-        """Success is a body field, not the HTTP status — both lanes
-        return ``enrolled: true`` on the way in."""
+        """Success is a body field, not the HTTP status — both lanes return
+        ``enrolled: true`` on the way in. The bundle carries no secret
+        (kid, endpoints, client id), so naming its keys is safe."""
         if not isinstance(data, dict) or not data.get("enrolled"):
+            shape = sorted(data) if isinstance(data, dict) else type(data).__name__
             raise MeshbookError(
-                "not_enrolled",
-                f"{what} returned 200 but no enrolled bundle: {str(data)[:200]}",
-                200,
+                "not_enrolled", f"{what} returned 200 but no enrolled bundle (got {shape}).", 200
             )
 
     def _mint(self) -> tuple[str, float]:
@@ -605,19 +672,22 @@ class _Agent(_Namespace):
             data=form,
             method="POST",
             headers={
-                "User-Agent": USER_AGENT,  # Cloudflare blocks default UAs
+                "User-Agent": self._c.user_agent,  # Cloudflare blocks default UAs
                 "Accept": "application/json",
                 # Form-encoded, unlike every meshbook call in this SDK.
                 "Content-Type": "application/x-www-form-urlencoded",
             },
         )
         ctype = ""
+        # The token endpoint is a POST and is never retried (a retried mint
+        # is harmless, but the contract's rule is simpler kept absolute).
         try:
             with _client._urlopen(req, timeout=self._c.timeout) as resp:
                 raw = resp.read().decode("utf-8")
                 ctype = (getattr(resp, "headers", None) or {}).get("Content-Type", "") or ""
         except urllib.error.HTTPError as e:
             _raise_from_token_error(e)
+            raise  # unreachable
         except urllib.error.URLError as e:
             raise MeshbookError("network_error", str(e.reason)) from e
 
@@ -647,4 +717,7 @@ class _Agent(_Namespace):
                 lifetime = advertised
         except (TypeError, ValueError):
             pass
+        exp = _jwt_exp(str(access))
+        if exp is not None:
+            lifetime = min(lifetime, max(0.0, exp - time.time()))
         return str(access), lifetime

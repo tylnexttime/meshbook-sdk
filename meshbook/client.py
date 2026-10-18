@@ -1,43 +1,47 @@
-"""meshbook.client — the whole SDK in one file.
+"""meshbook.client — the HTTP core and :class:`MeshbookClient`.
 
-Extracted from the proven HTTP core of meshbook-cli (mesh/cli.py):
-same envelope unwrap, same config file, same bearer-token auth, same
-X-Active-Mesh-Id header contract. Differences from the CLI:
+Since 0.4.0 this SDK is the single Python core for meshbook: meshbook-cli
+and meshbook-mcp call it instead of carrying their own copies of the
+config code, the HTTP layer, envelope parsing, error mapping, the agent
+lane and name resolution.
 
-* Library, not a tool — nothing prints, nothing calls sys.exit().
-  Every failure raises :class:`MeshbookError`.
-* Namespaced methods (``client.contacts.list()``) instead of argparse
-  subcommands.
-* Never writes the config file. ``client.meshes.use()`` only changes
-  the in-memory active mesh for this client instance; the CLI remains
-  the owner of ~/.meshbook/config. (The agent lane in
-  :mod:`meshbook.agent` does write key material — that is the one
-  exception, and it writes only the two ``agent-key.*`` files.)
+* Library, not a tool: nothing prints, nothing calls ``sys.exit()``. Every
+  failure raises :class:`MeshbookError`.
+* Every namespace method goes through ``_call(<registry key>)`` — see
+  :mod:`meshbook._endpoints`, which is what the contract check reads.
+* The config file is owned by :mod:`meshbook.config`; the client only
+  writes it when asked to (``meshes.use(..., persist=True)`` and the agent
+  lane's ``persist=True``).
 
 Return shapes
 -------------
-Most methods return plain dicts/lists exactly as the API sends them
-(camelCase keys — ``displayName``, ``bodyMd``, ``createdAt`` …), after
-stripping the canonical ``{ok, data}`` envelope and the paginated
-``{items, total}`` wrapper. A handful of stable shapes get cheap frozen
-dataclasses (:class:`User`, :class:`Mesh`, :class:`ExportJob`,
-:class:`Attachment`); each keeps the full server payload in ``.raw``
-so nothing is ever lost in translation.
+Single objects are plain dicts exactly as the API sends them (camelCase
+keys — ``displayName``, ``bodyMd``, ``createdAt`` …), with the ``{ok,
+data}`` envelope stripped. Lists come back as :class:`ItemList` — a real
+``list`` that also carries the server's ``total`` and the ``limit`` /
+``offset`` of the call. A handful of stable shapes get frozen dataclasses
+(:class:`User`, :class:`Mesh`, :class:`ExportJob`, :class:`Attachment`);
+each keeps the full payload in ``.raw``.
 """
 from __future__ import annotations
 
-import base64
+import email.utils
 import json
-import mimetypes
+import logging
 import os
-import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid as _uuid
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
+
+from . import config as _config
+from ._endpoints import ENDPOINTS, Endpoint
+from .errors import MeshbookError
+from .models import Attachment, ExportJob, ItemList, Mesh, SearchResults, User
 
 # Read from the INSTALLED package metadata, never hardcoded. A literal here
 # goes stale the moment pyproject is bumped, and the value rides on every
@@ -49,7 +53,7 @@ from typing import Any
 # self-reporting 0.6.0 (fixed as DEV-DEBT §92), meshbook-mcp shipped 0.5.0
 # self-reporting 0.4.0 (found by Wren 2026-08-20), and this constant read
 # 0.1.0 while pyproject said 0.2.0 -- caught by a pre-release gate about
-# ninety seconds before publishing. The guarding test below crosses to
+# ninety seconds before publishing. The guarding test crosses to
 # pyproject.toml, which is the only place the shipped truth lives.
 try:
     from importlib.metadata import version as _pkg_version
@@ -60,111 +64,34 @@ except Exception:  # uninstalled dev checkout only
 USER_AGENT = f"meshbook-sdk/{VERSION}"  # Cloudflare blocks default UAs
 DEFAULT_BASE = "https://meshbook.org"
 
+#: Methods the client may retry on 429/503. Never POST or PATCH: a retried
+#: write that the server had in fact applied would apply twice.
+RETRYABLE_METHODS = frozenset({"GET", "HEAD", "PUT", "DELETE"})
+RETRYABLE_STATUSES = frozenset({429, 503})
+#: Retry-After is honoured up to this many seconds, never longer.
+MAX_RETRY_AFTER = 30.0
 
-# ─── errors ────────────────────────────────────────────────────────────
+log = logging.getLogger("meshbook")
 
+T = TypeVar("T")
 
-class MeshbookError(Exception):
-    """Any failure talking to meshbook.org.
-
-    Attributes:
-        status:  HTTP status code (0 for network / local errors).
-        code:    machine code from the API error envelope
-                 (e.g. ``forbidden``, ``not_found``, ``network_error``).
-        message: human-readable message.
-    """
-
-    def __init__(self, code: str, message: str, status: int = 0):
-        self.code = code
-        self.message = message
-        self.status = status
-        super().__init__(f"[{status}] {code}: {message}")
-
-
-# ─── dataclasses (cheap typed views; .raw always holds the full dict) ──
-
-
-@dataclass(frozen=True)
-class User:
-    id: str
-    username: str
-    display_name: str
-    identity_type: str
-    raw: dict = field(repr=False)
-
-    @classmethod
-    def from_api(cls, d: dict) -> User:
-        return cls(
-            id=d.get("id", ""),
-            username=d.get("username", ""),
-            display_name=d.get("displayName", ""),
-            identity_type=d.get("identityType", ""),
-            raw=d,
-        )
+__all__ = [
+    "DEFAULT_BASE",
+    "USER_AGENT",
+    "VERSION",
+    "Attachment",
+    "Client",
+    "ExportJob",
+    "ItemList",
+    "Mesh",
+    "MeshbookClient",
+    "MeshbookError",
+    "SearchResults",
+    "User",
+]
 
 
-@dataclass(frozen=True)
-class Mesh:
-    id: str
-    name: str
-    mesh_type: str
-    member_role: str
-    raw: dict = field(repr=False)
-
-    @classmethod
-    def from_api(cls, d: dict) -> Mesh:
-        return cls(
-            id=d.get("id", ""),
-            name=d.get("name", ""),
-            mesh_type=d.get("meshType") or d.get("type") or "",
-            member_role=d.get("memberRole") or "",
-            raw=d,
-        )
-
-
-@dataclass(frozen=True)
-class ExportJob:
-    id: str
-    mesh_id: str
-    status: str  # pending | running | ready | failed
-    byte_size: int | None
-    download_url: str | None
-    expires_at: str | None
-    raw: dict = field(repr=False)
-
-    @classmethod
-    def from_api(cls, d: dict) -> ExportJob:
-        return cls(
-            id=d.get("id", ""),
-            mesh_id=d.get("meshId", ""),
-            status=d.get("status", ""),
-            byte_size=d.get("byteSize"),
-            download_url=d.get("downloadUrl"),
-            expires_at=d.get("expiresAt"),
-            raw=d,
-        )
-
-
-@dataclass(frozen=True)
-class Attachment:
-    id: str
-    filename: str
-    mime_type: str
-    byte_size: int | None
-    raw: dict = field(repr=False)
-
-    @classmethod
-    def from_api(cls, d: dict) -> Attachment:
-        return cls(
-            id=d.get("id", ""),
-            filename=d.get("filename", ""),
-            mime_type=d.get("mimeType", ""),
-            byte_size=d.get("byteSize"),
-            raw=d,
-        )
-
-
-# ─── envelope helpers (verbatim semantics from meshbook-cli) ───────────
+# ─── envelope helpers ──────────────────────────────────────────────────
 
 
 def _data(payload: Any) -> Any:
@@ -174,68 +101,111 @@ def _data(payload: Any) -> Any:
     return payload
 
 
-def _items(payload: Any) -> list:
-    """Normalise a list response through the envelope to a plain list.
+def _as_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    return None
 
-    Handles all three shapes the API emits: a bare list, {data: [...]},
-    and the ok_list paginated shape {data: {items: [...], total}}.
+
+def _item_list(
+    payload: Any,
+    *,
+    limit: int | None = None,
+    offset: int | None = None,
+    cls: type[ItemList[Any]] = ItemList,
+) -> ItemList[Any]:
+    """Any list response → :class:`ItemList`, keeping the envelope.
+
+    Handles every shape the API emits: a bare list, ``{data: [...]}``, and
+    the ``ok_list`` shape ``{data: {items: [...], total, page, pageSize,
+    …}}``. ``total`` is the server's (``None`` for a bare list).
+
+    If the server ignored the pagination this call asked for — it sent
+    back more than ``limit`` rows — the page is cut client-side
+    (``[offset:offset+limit]``) and ``total`` is the full count it sent, so
+    ``limit=`` means the same thing on every list method.
     """
     data = payload.get("data", payload) if isinstance(payload, dict) else payload
-    if isinstance(data, dict) and "items" in data:
-        data = data["items"]
-    return data or []
+    total: int | None = None
+    meta: dict[str, Any] = {}
+    if isinstance(data, dict):
+        items = data.get("items")
+        total = _as_int(data.get("total"))
+        meta = {k: v for k, v in data.items() if k not in ("items", "total")}
+        srv_limit = _as_int(meta.get("limit"))
+        srv_offset = _as_int(meta.get("offset"))
+        if srv_limit is not None:
+            limit = srv_limit
+        if srv_offset is not None:
+            offset = srv_offset
+    else:
+        items = data
+    rows = list(items) if isinstance(items, list) else []
+    if limit is not None and len(rows) > limit:
+        start = offset or 0
+        if total is None or total == len(rows):
+            total = len(rows)
+        rows = rows[start : start + limit]
+        meta["client_paginated"] = True
+    return cls(rows, total=total, limit=limit, offset=offset, meta=meta)
 
 
-# ─── config-file loading (same file the CLI writes) ────────────────────
+def _items(payload: Any) -> ItemList[Any]:
+    """Normalise a list response through the envelope (kept for 0.3 callers)."""
+    return _item_list(payload)
 
 
-def _default_config_path() -> Path:
-    """Same resolution order as meshbook-cli: MESHBOOK_CONFIG_DIR env,
-    else existing ~/.meshbook, else $XDG_CONFIG_HOME/meshbook, else
-    ~/.meshbook."""
-    explicit = os.environ.get("MESHBOOK_CONFIG_DIR")
-    if explicit:
-        return Path(explicit).expanduser() / "config"
-    legacy = Path.home() / ".meshbook"
-    if legacy.exists():
-        return legacy / "config"
-    xdg = os.environ.get("XDG_CONFIG_HOME")
-    if xdg:
-        return Path(xdg).expanduser() / "meshbook" / "config"
-    return legacy / "config"
+def _page(limit: int | None, offset: int | None) -> dict[str, Any]:
+    """The pagination query params, validated."""
+    if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 1):
+        raise MeshbookError("bad_argument", f"limit must be a positive int, got {limit!r}.")
+    if offset is not None and (
+        not isinstance(offset, int) or isinstance(offset, bool) or offset < 0
+    ):
+        raise MeshbookError("bad_argument", f"offset must be an int >= 0, got {offset!r}.")
+    return {"limit": limit, "offset": offset}
 
 
-def _load_config(config_path: str | os.PathLike | None) -> dict:
-    path = Path(config_path) if config_path else _default_config_path()
-    if not path.exists():
-        return {}
+def _is_uuid(value: str) -> bool:
     try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
-        return loaded if isinstance(loaded, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
+        _uuid.UUID(str(value))
+    except (ValueError, TypeError, AttributeError):
+        return False
+    return True
 
 
-# ─── transport seam ────────────────────────────────────────────────────
+# ─── transport seams ───────────────────────────────────────────────────
 #
-# All HTTP flows through this one function so tests (and exotic runtimes)
-# can monkeypatch `meshbook.client._urlopen` and never touch the network.
+# All HTTP flows through `_urlopen` so tests (and exotic runtimes) can
+# monkeypatch `meshbook.client._urlopen` and never touch the network; the
+# agent lane's token mint reaches it the same way. Back-off sleeps go
+# through `_sleep` so tests can record them instead of waiting.
 
 
-def _urlopen(req: urllib.request.Request, timeout: float):
+def _urlopen(req: urllib.request.Request, timeout: float) -> Any:
     return urllib.request.urlopen(req, timeout=timeout)  # noqa: S310
 
 
-_FILENAME_STAR_RE = re.compile(r"filename\*=UTF-8''([^;]+)")
-_FILENAME_RE = re.compile(r'filename="([^"]+)"')
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+#: Optional observer called with (method, url) for every request the client
+#: sends. The test-suite uses it to assert that every request matches an
+#: entry in the endpoint registry. None in normal use.
+_on_request: Callable[[str, str], None] | None = None
 
 
 def _filename_from_disposition(disp: str) -> str:
     """Content-Disposition → filename; the RFC 5987 filename*= form wins."""
-    m = _FILENAME_STAR_RE.search(disp)
+    import re
+
+    m = re.search(r"filename\*=UTF-8''([^;]+)", disp)
     if m:
         return urllib.parse.unquote(m.group(1))
-    m = _FILENAME_RE.search(disp)
+    m = re.search(r'filename="([^"]+)"', disp)
     if m:
         return m.group(1)
     return "attachment"
@@ -247,14 +217,13 @@ def _err_fields(payload: Any, raw: str) -> tuple[str, str]:
     Ours is ``{"error": {code, message}}``. Anything raised as a FastAPI
     HTTPException skips the envelope entirely and arrives as
     ``{"detail": {code, message}}`` or ``{"detail": "string"}`` — which is
-    every 401, because ``require_user`` raises bare and no handler is
-    registered for it. Reading only ``error`` reports those as
-    ``http_error: {"detail": …}``, leaking an implementation detail to the
-    caller. Ported from meshbook-cli's ``_err_fields`` (2026-08-20).
+    every 401, because ``require_user`` raises bare. Reading only ``error``
+    reports those as ``http_error: {"detail": …}``, leaking an
+    implementation detail to the caller (the MCP did exactly that).
     """
     if isinstance(payload, dict):
         err = payload.get("error")
-        if isinstance(err, dict):
+        if isinstance(err, dict) and err:
             return str(err.get("code") or "http_error"), str(err.get("message") or raw[:200])
         detail = payload.get("detail")
         if isinstance(detail, dict):
@@ -264,6 +233,12 @@ def _err_fields(payload: Any, raw: str) -> tuple[str, str]:
             )
         if isinstance(detail, str) and detail:
             return "http_error", detail
+        if isinstance(detail, list) and detail:
+            # FastAPI's own 422 shape: [{loc, msg, type}, ...]
+            first = detail[0] if isinstance(detail[0], dict) else {}
+            loc = ".".join(str(p) for p in first.get("loc", []) if p != "body")
+            msg = str(first.get("msg") or "validation failed")
+            return "validation_error", f"{loc}: {msg}" if loc else msg
     return "http_error", raw[:200]
 
 
@@ -277,229 +252,590 @@ def _raise_from_http_error(e: urllib.error.HTTPError) -> None:
     raise MeshbookError(code, message, status=e.code) from e
 
 
+def _retry_after(headers: Any) -> float | None:
+    """Parse Retry-After (delta-seconds or an HTTP date) → seconds, capped.
+
+    None when the header is absent or unparseable.
+    """
+    if headers is None:
+        return None
+    try:
+        value = headers.get("Retry-After")
+    except Exception:
+        return None
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        seconds = float(text)
+    except ValueError:
+        try:
+            when = email.utils.parsedate_to_datetime(text)
+        except (TypeError, ValueError, IndexError):
+            return None
+        if when is None:
+            return None
+        if when.tzinfo is None:
+            import datetime as _dt
+
+            when = when.replace(tzinfo=_dt.timezone.utc)
+        seconds = when.timestamp() - time.time()
+    if seconds != seconds:  # NaN
+        return None
+    return max(0.0, min(seconds, MAX_RETRY_AFTER))
+
+
+def _backoff(attempt: int) -> float:
+    """Delay before retry *attempt* (1-based) when no Retry-After was sent."""
+    return min(0.5 * (2 ** (attempt - 1)), MAX_RETRY_AFTER)
+
+
 # ─── the client ────────────────────────────────────────────────────────
 
 
 class MeshbookClient:
-    """Synchronous meshbook.org API client.
+    """Synchronous meshbook.org API client (also importable as ``meshbook.Client``).
 
     Args:
         token: bearer API token (``mb_token_…``, minted in the web UI at
-            /v2/#/account/api-tokens). Resolution order:
-            explicit arg → ``MESHBOOK_TOKEN`` env var → the CLI config
-            file (``~/.meshbook/config`` by default).
-        base: API base URL. Defaults to ``https://meshbook.org``; pass
-            ``None`` to fall back to ``MESHBOOK_BASE`` env var, then the
-            config file's ``base``, then the production URL. IMPORTANT:
-            always the apex domain — www.meshbook.org 301s and the
-            redirect downgrades POST to GET.
-        active_mesh_id: mesh UUID sent as ``X-Active-Mesh-Id`` on every
-            request. Falls back to the config file's value, or use
-            ``client.meshes.use(...)`` after construction.
-        config_path: explicit path to a CLI-format config file (JSON
-            with ``token`` / ``base`` / ``active_mesh_id`` keys).
-        timeout: per-request timeout in seconds (default 30; downloads 120).
-        auth: ``"bearer"`` (default — the long-lived ``mb_token_`` above,
-            unchanged) or ``"agent"``, in which case every authenticated
-            call uses a §93 token this client mints for itself from the
-            enrolled private key (see ``client.agent``). Opt-in: an
-            existing caller passing ``token=`` behaves exactly as before,
-            and ``client.auth`` can be flipped after construction once a
-            key is enrolled.
+            /v2/#/account/api-tokens). Resolution: explicit arg →
+            ``MESHBOOK_TOKEN`` → the config file's ``token``.
+        base: API base URL. Resolution: explicit arg → ``MESHBOOK_BASE`` →
+            the config file's ``base`` → ``https://meshbook.org``.
+            IMPORTANT: always the apex domain — www.meshbook.org 301s and
+            the redirect downgrades POST to GET.
+        mesh: the mesh this client works in, by UUID or NAME. Resolution:
+            per-call ``mesh=`` (on every mesh-scoped method) → this →
+            ``MESHBOOK_MESH`` → the config file's ``active_mesh_id``. A
+            name is resolved case-insensitively over your meshes (one
+            ``GET /api/meshes``, cached per client); unknown →
+            ``mesh_not_found``, more than one match → ``mesh_ambiguous``.
+            Never persisted — only ``meshes.use(..., persist=True)`` writes
+            the config.
+        active_mesh_id: the 0.3 spelling — a mesh UUID, sent as-is. Same
+            precedence slot as ``mesh=``.
+        config_path: explicit path to the config file (default
+            ``meshbook.config.config_path()``).
+        timeout: per-request timeout in seconds (default 30).
+        download_timeout: timeout for file downloads (default
+            ``max(timeout, 120)``).
+        max_attempts: attempts per request when the server answers 429 or
+            503 (default 3; 1 disables retrying). Only GET/HEAD/PUT/DELETE
+            are retried, never POST/PATCH; ``Retry-After`` is honoured
+            (seconds or an HTTP date, capped at 30 s).
+        auth: ``"bearer"`` or ``"agent"`` (mint §93 tokens from the
+            enrolled key for every call). Default ``None`` resolves it: an
+            explicit ``token=`` or ``MESHBOOK_TOKEN`` means bearer;
+            otherwise the config's ``auth_mode: "agent"`` turns the agent
+            lane on — with the stored bearer as the fallback if a mint
+            fails, exactly as meshbook-cli and meshbook-mcp behaved (§96).
+            An explicit ``auth="agent"`` never falls back.
         agent_key_path: where the agent private key lives. Defaults to
-            ``agent-key.pem`` beside the config file — the same file
-            ``mesh agent enroll`` writes — with the mint bundle alongside
-            as ``agent-key.json``. Pass an explicit path when several
-            identities share a box; one config dir means one agent
-            identity, and both reference clients hardcode that assumption.
+            ``agent-key.pem`` beside the config file — the same file every
+            meshbook client writes — with the mint bundle alongside as
+            ``agent-key.json``. One config dir means one agent identity.
+        user_agent: a product token to put in front of the SDK's own
+            (e.g. ``"meshbook-cli/0.12.0"``), so server logs can tell the
+            CLI's traffic from the MCP's.
     """
 
     def __init__(
         self,
         token: str | None = None,
-        base: str | None = DEFAULT_BASE,
+        base: str | None = None,
         active_mesh_id: str | None = None,
-        config_path: str | os.PathLike | None = None,
+        config_path: str | os.PathLike[str] | None = None,
         timeout: float = 30.0,
-        auth: str = "bearer",
-        agent_key_path: str | os.PathLike | None = None,
+        auth: str | None = None,
+        agent_key_path: str | os.PathLike[str] | None = None,
+        *,
+        mesh: str | None = None,
+        download_timeout: float | None = None,
+        max_attempts: int = 3,
+        user_agent: str | None = None,
     ):
-        if auth not in ("bearer", "agent"):
+        if auth not in (None, "bearer", "agent"):
             raise MeshbookError(
                 "bad_auth", f"Unknown auth mode {auth!r}. Use 'bearer' (default) or 'agent'."
             )
-        self.config_path = Path(config_path) if config_path else _default_config_path()
-        cfg = _load_config(self.config_path)
-        self.token = token or os.environ.get("MESHBOOK_TOKEN") or cfg.get("token")
-        resolved_base = base or os.environ.get("MESHBOOK_BASE") or cfg.get("base") or DEFAULT_BASE
+        if max_attempts < 1:
+            raise MeshbookError("bad_argument", "max_attempts must be >= 1.")
+        self.config_path: Path = (
+            Path(config_path).expanduser() if config_path else _config.config_path()
+        )
+        cfg = _config.load_config(self.config_path)
+        self.config: dict[str, Any] = cfg
+
+        env_token = os.environ.get("MESHBOOK_TOKEN") or None
+        cfg_token = cfg.get("token") if isinstance(cfg.get("token"), str) else None
+        self.token: str | None = token or env_token or cfg_token
+
+        cfg_base = cfg.get("base") if isinstance(cfg.get("base"), str) else None
+        resolved_base = base or os.environ.get("MESHBOOK_BASE") or cfg_base or DEFAULT_BASE
         self.base = resolved_base.rstrip("/")
-        self.active_mesh_id = active_mesh_id or cfg.get("active_mesh_id")
+
+        # ── mesh precedence: Client(mesh/active_mesh_id) > env > config ──
+        if mesh and active_mesh_id and mesh != active_mesh_id:
+            raise MeshbookError(
+                "bad_argument", "Pass mesh= or active_mesh_id=, not both with different values."
+            )
+        self._active_mesh_id: str | None = None
+        self._pending_mesh_ref: str | None = None
+        self.mesh_source: str | None = None
+        env_mesh = (os.environ.get("MESHBOOK_MESH") or "").strip() or None
+        cfg_mesh = cfg.get("active_mesh_id") if isinstance(cfg.get("active_mesh_id"), str) else None
+        if active_mesh_id:
+            self._active_mesh_id, self.mesh_source = str(active_mesh_id), "argument"
+        elif mesh:
+            self._set_mesh_ref(mesh, "argument")
+        elif env_mesh:
+            self._set_mesh_ref(env_mesh, "env")
+        elif cfg_mesh:
+            # The config key is an id by definition (only meshes.use writes it).
+            self._active_mesh_id, self.mesh_source = cfg_mesh, "config"
+
+        # ── auth lane ──
+        self._agent_fallback = False
+        if auth is not None:
+            self.auth: str = auth
+            self.auth_source = "argument"
+        elif token or env_token:
+            self.auth, self.auth_source = "bearer", ("argument" if token else "env")
+        elif cfg.get("auth_mode") == "agent":
+            self.auth, self.auth_source = "agent", "config"
+            self._agent_fallback = True
+        else:
+            self.auth, self.auth_source = "bearer", "default"
+
         self.timeout = timeout
-        self.auth = auth
-        self.agent_key_path = (
+        self.download_timeout = (
+            download_timeout if download_timeout is not None else max(timeout, 120.0)
+        )
+        self.max_attempts = max_attempts
+        self.user_agent = f"{user_agent} {USER_AGENT}" if user_agent else USER_AGENT
+        self.agent_key_path: Path = (
             Path(agent_key_path).expanduser()
             if agent_key_path
             else self.config_path.parent / "agent-key.pem"
         )
 
-        # _Agent lives in meshbook/agent.py because it is the one surface
-        # with an optional dependency; that module imports this one, so it
-        # is imported here rather than at module scope.
-        from .agent import _Agent
-
-        self.meshes = _Meshes(self)
-        self.contacts = _Contacts(self)
-        self.leads = _Leads(self)
-        self.tasks = _Tasks(self)
-        self.chat = _Chat(self)
-        self.channels = _Channels(self)
-        self.notifications = _Notifications(self)
-        self.files = _Files(self)
-        self.exports = _Exports(self)
-        self.agent = _Agent(self)
-
-        self._me_cache: dict | None = None
+        self._me_cache: dict[str, Any] | None = None
+        self._meshes_cache: list[Mesh] | None = None
         self._agent_token: str | None = None
         self._agent_token_expires_at: float = 0.0
 
-    # ── plumbing ──────────────────────────────────────────────────────
+        # Namespaces. _Agent lives in meshbook/agent.py (the one surface with
+        # an optional dependency) and the resources import this module for
+        # typing only, so both are imported here, not at module scope.
+        from . import resources as _r
+        from .agent import _Agent
 
-    def _bearer(self) -> str:
-        """The credential for an authenticated call.
+        self.meshes = _r.Meshes(self)
+        self.users = _r.Users(self)
+        self.contacts = _r.Contacts(self)
+        self.companies = _r.Companies(self)
+        self.pipelines = _r.Pipelines(self)
+        self.leads = _r.Leads(self)
+        self.tasks = _r.Tasks(self)
+        self.projects = _r.Projects(self)
+        self.tags = _r.Tags(self)
+        self.chat = _r.Chat(self)
+        self.channels = _r.Channels(self)
+        self.dms = _r.Dms(self)
+        self.notifications = _r.Notifications(self)
+        self.files = _r.Files(self)
+        self.exports = _r.Exports(self)
+        self.custom_fields = _r.CustomFields(self)
+        self.saved_views = _r.SavedViews(self)
+        self.events = _r.Events(self)
+        self.agent = _Agent(self)
 
-        ``auth="bearer"`` (default) → the long-lived ``mb_token_`` token,
-        exactly as before. ``auth="agent"`` → a §93 token this client mints
-        for itself from the enrolled private key, cached and re-minted
-        shortly before it expires (see ``client.agent.token``).
+    # ── mesh resolution ───────────────────────────────────────────────
+
+    def _set_mesh_ref(self, ref: str, source: str) -> None:
+        ref = ref.strip()
+        self.mesh_source = source
+        if _is_uuid(ref):
+            self._active_mesh_id, self._pending_mesh_ref = ref, None
+        else:
+            self._active_mesh_id, self._pending_mesh_ref = None, ref
+
+    @property
+    def active_mesh_id(self) -> str | None:
+        """The client-level mesh id (resolving a pending NAME on first read)."""
+        if self._pending_mesh_ref is not None:
+            ref = self._pending_mesh_ref
+            self._active_mesh_id = self._mesh_ref_to_id(ref)
+            self._pending_mesh_ref = None
+        return self._active_mesh_id
+
+    @active_mesh_id.setter
+    def active_mesh_id(self, value: str | None) -> None:
+        self._active_mesh_id = str(value) if value else None
+        self._pending_mesh_ref = None
+
+    def _my_meshes(self, refresh: bool = False) -> list[Mesh]:
+        if self._meshes_cache is None or refresh:
+            payload = self._call("meshes.list")
+            self._meshes_cache = [Mesh.from_api(m) for m in _item_list(payload)]
+        return self._meshes_cache
+
+    def _mesh_ref_to_id(self, ref: str) -> str:
+        """A mesh UUID (returned as-is) or NAME (resolved) → id."""
+        return self._mesh_lookup(ref, require_membership=False).id
+
+    def _mesh_lookup(self, ref: str, *, require_membership: bool) -> Mesh:
+        target = (ref or "").strip()
+        if not target:
+            raise MeshbookError("mesh_not_found", "Empty mesh name/id.")
+        if _is_uuid(target) and not require_membership:
+            return Mesh(id=target, name="", mesh_type="", member_role="", raw={"id": target})
+        mine = self._my_meshes()
+        if _is_uuid(target):
+            low_id = target.lower()
+            for m in mine:
+                if m.id.lower() == low_id:
+                    return m
+            raise MeshbookError("mesh_not_found", f"No mesh with id {target} among yours.", 404)
+        folded = target.casefold()
+        hits = [m for m in mine if m.name.casefold() == folded]
+        if len(hits) == 1:
+            return hits[0]
+        if not hits:
+            names = ", ".join(m.name for m in mine) or "(none)"
+            raise MeshbookError(
+                "mesh_not_found", f"No mesh matching {target!r}. Your meshes: {names}", 404
+            )
+        listing = "; ".join(f"{m.name} ({m.id})" for m in hits)
+        raise MeshbookError(
+            "mesh_ambiguous",
+            f"{len(hits)} meshes are named {target!r}: {listing}. Pass the id instead.",
+        )
+
+    def resolve_mesh(self, mesh: str | None = None) -> str | None:
+        """The mesh id a call would act in: per-call *mesh* (id or name) if
+        given, else the client-level mesh. None when there is none."""
+        if mesh is not None:
+            return self._mesh_ref_to_id(mesh)
+        return self.active_mesh_id
+
+    def _require_mesh(self, mesh: str | None = None) -> str:
+        mid = self.resolve_mesh(mesh)
+        if not mid:
+            raise MeshbookError(
+                "no_active_mesh",
+                "No active mesh. Pass mesh= (id or name), set MESHBOOK_MESH, or call "
+                "client.meshes.use(...).",
+            )
+        return mid
+
+    # ── credentials ───────────────────────────────────────────────────
+
+    def _credential(self) -> tuple[str, bool]:
+        """(bearer, minted) for an authenticated call.
+
+        ``auth="bearer"`` → the long-lived ``mb_token_``. ``auth="agent"`` →
+        a §93 token minted from the enrolled key (cached, re-minted 30 s
+        before expiry). When the agent lane came from the config file
+        (``auth_mode: "agent"``), a bench with no usable key, or a failed
+        mint, falls back to the stored bearer if there is one — the §96
+        contract both reference clients implement.
         """
         if self.auth == "agent":
-            return self.agent.token()
+            if self._agent_fallback and not self.agent.ready():
+                if self.token:
+                    return self.token, False
+                raise MeshbookError(
+                    "not_authenticated",
+                    f"auth_mode is 'agent' but there is no usable agent key at "
+                    f"{self.agent_key_path}, and no bearer is stored. Enroll a key or run "
+                    "`mesh login`.",
+                )
+            try:
+                return self.agent.token(), True
+            except MeshbookError as e:
+                if self._agent_fallback and self.token:
+                    log.warning(
+                        "agent-token mint failed (%s); falling back to the stored bearer "
+                        "for this call.",
+                        e.code,
+                    )
+                    return self.token, False
+                raise
         if not self.token:
             raise MeshbookError(
                 "not_authenticated",
                 "No API token. Pass token=, set MESHBOOK_TOKEN, or run `mesh login`.",
             )
-        return self.token
+        return self.token, False
 
-    def _headers(
-        self,
-        *,
-        require_auth: bool = True,
-        token: str | None = None,
-        send_active_mesh: bool = True,
-    ) -> dict:
-        headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-        if require_auth:
-            headers["Authorization"] = f"Bearer {token or self._bearer()}"
-        # Unauthenticated endpoints never carry the active mesh: the one
-        # that matters (§97 agent registration) is for callers who do not
-        # exist yet, and inheriting a config dir's mesh there makes a
-        # "fresh" registration quietly stateful.
-        if send_active_mesh and require_auth and self.active_mesh_id:
-            headers["X-Active-Mesh-Id"] = str(self.active_mesh_id)
-        return headers
+    def _bearer(self) -> str:
+        """The credential for an authenticated call (0.3 helper)."""
+        return self._credential()[0]
 
-    def _url(self, path: str, params: dict | None = None) -> str:
+    @property
+    def auth_mode(self) -> str:
+        """The lane the next call will actually use: ``"agent"`` or ``"bearer"``."""
+        if self.auth == "agent" and (not self._agent_fallback or self.agent.ready()):
+            return "agent"
+        return "bearer"
+
+    # ── transport ─────────────────────────────────────────────────────
+
+    def _url(self, path: str, params: Mapping[str, Any] | None = None) -> str:
         url = self.base + path
         if params:
-            clean = {k: v for k, v in params.items() if v is not None}
+            clean = {k: _query_value(v) for k, v in params.items() if v is not None}
             if clean:
                 url += "?" + urllib.parse.urlencode(clean)
         return url
+
+    def _send(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: Any = None,
+        params: Mapping[str, Any] | None = None,
+        require_auth: bool = True,
+        token: str | None = None,
+        mesh_id: str | None = None,
+        raw: bool = False,
+    ) -> Any:
+        """One logical request: auth, headers, 429/503 retries, one agent re-mint.
+
+        Returns parsed JSON, or ``(bytes, headers)`` when *raw*.
+        """
+        url = self._url(path, params)
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        method = method.upper()
+        attempt = 0
+        reminted = False
+        while True:
+            attempt += 1
+            headers = {"User-Agent": self.user_agent, "Accept": "application/json"}
+            minted = False
+            if require_auth:
+                if token is not None:
+                    bearer = token
+                else:
+                    bearer, minted = self._credential()
+                headers["Authorization"] = f"Bearer {bearer}"
+                # Unauthenticated endpoints never carry the active mesh.
+                if mesh_id:
+                    headers["X-Active-Mesh-Id"] = str(mesh_id)
+            if data is not None:
+                headers["Content-Type"] = "application/json"
+            req = urllib.request.Request(url, data=data, method=method, headers=headers)
+            if _on_request is not None:
+                _on_request(method, url)
+            timeout = self.download_timeout if raw else self.timeout
+            try:
+                with _urlopen(req, timeout=timeout) as resp:
+                    content = resp.read()
+                    resp_headers = getattr(resp, "headers", None) or {}
+            except urllib.error.HTTPError as e:
+                # §96: a 401 on a self-minted token usually means it died
+                # mid-flight (expiry race, source rotation). Re-mint ONCE.
+                # Safe for any method: a 401 is refused before the route runs.
+                if e.code == 401 and minted and not reminted:
+                    reminted = True
+                    attempt -= 1
+                    self.agent._forget_token()
+                    _close_quietly(e)
+                    continue
+                if (
+                    e.code in RETRYABLE_STATUSES
+                    and method in RETRYABLE_METHODS
+                    and attempt < self.max_attempts
+                ):
+                    delay = _retry_after(getattr(e, "headers", None))
+                    _close_quietly(e)
+                    _sleep(delay if delay is not None else _backoff(attempt))
+                    continue
+                _raise_from_http_error(e)
+                raise  # unreachable; keeps type checkers honest
+            except urllib.error.URLError as e:
+                raise MeshbookError("network_error", str(e.reason)) from e
+            break
+        if raw:
+            return content, resp_headers
+        text = content.decode("utf-8") if isinstance(content, bytes) else str(content)
+        if not text:
+            return {}
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise MeshbookError(
+                "bad_response", f"{method} {path} returned a non-JSON body ({len(text)} chars)."
+            ) from e
+        # Defensive: a 200 body carrying {ok: false, error: {...}} is
+        # still an error under the envelope contract.
+        if isinstance(payload, dict) and payload.get("ok") is False:
+            err = payload.get("error") or {}
+            raise MeshbookError(
+                str(err.get("code", "api_error")),
+                str(err.get("message", "API reported ok=false")),
+                200,
+            )
+        return payload
+
+    def _endpoint_mesh(
+        self, ep: Endpoint, path_params: Mapping[str, Any] | None, mesh: str | None
+    ) -> str | None:
+        if ep.mesh == "none" or not ep.auth:
+            return None
+        if ep.mesh == "path":
+            return str((path_params or {})["mesh_id"])
+        return self.resolve_mesh(mesh)
+
+    def _call(
+        self,
+        key: str,
+        *,
+        path: Mapping[str, Any] | None = None,
+        body: Any = None,
+        params: Mapping[str, Any] | None = None,
+        mesh: str | None = None,
+        token: str | None = None,
+    ) -> Any:
+        """The ONLY way namespace code reaches the network: a registry key
+        from :mod:`meshbook._endpoints`, never a free-form path."""
+        ep = ENDPOINTS[key]
+        return self._send(
+            ep.method,
+            ep.render(dict(path) if path else None),
+            body=body,
+            params=params,
+            require_auth=ep.auth,
+            token=token,
+            mesh_id=self._endpoint_mesh(ep, path, mesh),
+        )
+
+    def _list(
+        self,
+        key: str,
+        *,
+        path: Mapping[str, Any] | None = None,
+        params: Mapping[str, Any] | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+        mesh: str | None = None,
+        cls: type[ItemList[Any]] = ItemList,
+        lead: Mapping[str, Any] | None = None,
+    ) -> ItemList[Any]:
+        # Query order: `lead` (e.g. a search term), then pagination, then
+        # filters: the exact order the 0.3 wire used, so URLs are stable.
+        query: dict[str, Any] = dict(lead or {})
+        query.update(_page(limit, offset))
+        query.update(params or {})
+        payload = self._call(key, path=path, params=query, mesh=mesh)
+        return _item_list(payload, limit=limit, offset=offset, cls=cls)
+
+    def _download(
+        self,
+        key: str,
+        *,
+        path: Mapping[str, Any],
+        out_path: str | os.PathLike[str] | None,
+        mesh: str | None = None,
+    ) -> Path:
+        ep = ENDPOINTS[key]
+        content, headers = self._send(
+            ep.method,
+            ep.render(dict(path)),
+            require_auth=ep.auth,
+            mesh_id=self._endpoint_mesh(ep, path, mesh),
+            raw=True,
+        )
+        disp = ""
+        try:
+            disp = headers.get("Content-Disposition", "") or ""
+        except Exception:
+            disp = ""
+        server_name = _filename_from_disposition(disp)
+        out = Path(out_path).expanduser() if out_path else Path(server_name)
+        if out.is_dir():
+            out = out / server_name
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(content)
+        return out
 
     def request(
         self,
         method: str,
         path: str,
         *,
-        body: dict | None = None,
-        params: dict | None = None,
+        body: Any = None,
+        params: Mapping[str, Any] | None = None,
         require_auth: bool = True,
         token: str | None = None,
         send_active_mesh: bool = True,
+        mesh: str | None = None,
     ) -> Any:
-        """Raw escape hatch: call any /api path, get the parsed JSON
-        payload back (envelope NOT stripped — use ``meshbook.client._data``
-        / ``_items`` or the namespaced methods for that).
+        """Raw escape hatch: call any /api path, get the parsed JSON payload
+        back (envelope NOT stripped — use ``meshbook.client._data`` /
+        ``_item_list`` or the namespaced methods for that).
 
-        ``token=`` overrides this call's Authorization (the agent lane uses
-        it to present a freshly minted token without touching client
-        state); ``send_active_mesh=False`` suppresses X-Active-Mesh-Id."""
-        headers = self._headers(
-            require_auth=require_auth, token=token, send_active_mesh=send_active_mesh
+        Unchecked by the contract check by design: namespace code never uses
+        it (a test enforces that). ``token=`` overrides this call's
+        Authorization; ``send_active_mesh=False`` suppresses
+        X-Active-Mesh-Id; ``mesh=`` sends that mesh (id or name) instead of
+        the client's.
+        """
+        mesh_id = self.resolve_mesh(mesh) if (send_active_mesh and require_auth) else None
+        return self._send(
+            method,
+            path,
+            body=body,
+            params=params,
+            require_auth=require_auth,
+            token=token,
+            mesh_id=mesh_id,
         )
-        data = None
-        if body is not None:
-            data = json.dumps(body).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-        req = urllib.request.Request(
-            self._url(path, params), data=data, method=method, headers=headers
-        )
-        try:
-            with _urlopen(req, timeout=self.timeout) as resp:
-                raw = resp.read().decode("utf-8")
-        except urllib.error.HTTPError as e:
-            _raise_from_http_error(e)
-        except urllib.error.URLError as e:
-            raise MeshbookError("network_error", str(e.reason)) from e
-        if not raw:
-            return {}
-        payload = json.loads(raw)
-        # Defensive: a 200 body carrying {ok: false, error: {...}} is
-        # still an error under the envelope contract.
-        if isinstance(payload, dict) and payload.get("ok") is False:
-            err = payload.get("error") or {}
-            raise MeshbookError(
-                err.get("code", "api_error"), err.get("message", "API reported ok=false"), 200
-            )
-        return payload
-
-    def _get_items(self, path: str, params: dict | None = None) -> list:
-        return _items(self.request("GET", path, params=params))
-
-    def _get_data(self, path: str, params: dict | None = None) -> Any:
-        return _data(self.request("GET", path, params=params))
 
     def download_raw(self, path: str) -> tuple[bytes, str]:
-        """Raw-bytes GET (downloads are not JSON). Returns
-        ``(bytes, server_filename)`` where the filename comes from
-        Content-Disposition when present."""
-        req = urllib.request.Request(
-            self._url(path), method="GET", headers=self._headers()
+        """Raw-bytes GET of any path (downloads are not JSON). Returns
+        ``(bytes, server_filename)`` from Content-Disposition when present."""
+        content, headers = self._send(
+            "GET", path, mesh_id=self.resolve_mesh(None), raw=True
         )
+        disp = ""
         try:
-            with _urlopen(req, timeout=max(self.timeout, 120.0)) as resp:
-                raw = resp.read()
-                disp = resp.headers.get("Content-Disposition", "") or ""
-        except urllib.error.HTTPError as e:
-            _raise_from_http_error(e)
-        except urllib.error.URLError as e:
-            raise MeshbookError("network_error", str(e.reason)) from e
-        return raw, _filename_from_disposition(disp)
-
-    def _download_to(self, path: str, out_path: str | os.PathLike | None) -> Path:
-        raw, server_name = self.download_raw(path)
-        out = Path(out_path) if out_path else Path(server_name)
-        if out.is_dir():
-            out = out / server_name
-        out.write_bytes(raw)
-        return out
+            disp = headers.get("Content-Disposition", "") or ""
+        except Exception:
+            disp = ""
+        return content, _filename_from_disposition(disp)
 
     # ── identity ──────────────────────────────────────────────────────
 
-    def me(self) -> dict:
+    def health(self) -> dict[str, Any]:
+        """GET /api/health — unauthenticated reachability probe (``mesh doctor``)."""
+        out = _data(self._call("health"))
+        return out if isinstance(out, dict) else {"ok": True}
+
+    def me(self) -> dict[str, Any]:
         """GET /api/me — full payload dict (user, activeMeshId, …).
-        NOTE: /api/me is permissive and answers 200 with
-        ``{authenticated: false}`` for a bad token; this method converts
-        that into a MeshbookError so callers never see a half-auth state."""
-        me = self._get_data("/api/me")
+
+        /api/me is permissive and answers 200 with ``{authenticated: false}``
+        for a bad token; this converts that into a MeshbookError so callers
+        never see a half-auth state. Sends no active mesh: who you are does
+        not depend on where you are (and a stale out-of-scope mesh must not
+        be able to break the one call that diagnoses it).
+        """
+        me = _data(self._call("me"))
         if isinstance(me, dict) and me.get("authenticated") is False:
             raise MeshbookError(
                 "not_authenticated",
                 "/api/me reports authenticated=false — token invalid or revoked.",
                 401,
             )
-        return me if isinstance(me, dict) else {}
+        if isinstance(me, dict):
+            self._me_cache = me
+            return me
+        return {}
 
     def whoami(self) -> User:
         """The signed-in user as a typed :class:`User`."""
@@ -511,455 +847,22 @@ class MeshbookClient:
 
     def _self_user_id(self) -> str:
         if self._me_cache is None:
-            self._me_cache = self.me()
-        return ((self._me_cache or {}).get("user") or {}).get("id") or ""
-
-    def _require_mesh(self) -> str:
-        if not self.active_mesh_id:
-            raise MeshbookError(
-                "no_active_mesh",
-                "No active mesh. Pass active_mesh_id= or call client.meshes.use(...).",
-            )
-        return str(self.active_mesh_id)
+            self.me()
+        return str(((self._me_cache or {}).get("user") or {}).get("id") or "")
 
 
-# ─── namespaces ────────────────────────────────────────────────────────
+#: The contract's spelling.
+Client = MeshbookClient
 
 
-class _Namespace:
-    def __init__(self, client: MeshbookClient):
-        self._c = client
+def _query_value(value: Any) -> Any:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return value
 
 
-class _Meshes(_Namespace):
-    def list_mine(self) -> list[Mesh]:
-        """GET /api/meshes — every mesh you're a member of."""
-        return [Mesh.from_api(m) for m in self._c._get_items("/api/meshes")]
-
-    def use(self, mesh: str, verify: bool = True) -> Mesh:
-        """Set the client's active mesh by UUID or name (case-insensitive).
-        In-memory only — never writes the CLI config file.
-
-        Verifies with the server before switching (2026-08-20). Membership is
-        NOT the predicate the server gates requests on: it gates on the TOKEN's
-        `scope_meshes`. So a member holding a narrower token could select a mesh
-        here, get a Mesh object back, and then have every subsequent call fail
-        `token_out_of_scope` with nothing explaining why.
-
-        Reported by Wren (2026-08-20) against the CLI and MCP, where the same
-        shape was far worse: those write the id to the SHARED config file, so
-        one bad call locked the whole bench — `login` included — with no exit
-        but hand-editing the file. This SDK was always in-memory only, so its
-        blast radius is one client object and discarding it recovers. Fixed
-        anyway: a "success" that guarantees the next call fails is still a lie,
-        and this is the only client left that would accept one silently.
-
-        Pass ``verify=False`` to restore the old local-only behaviour (offline
-        use, or a mesh the caller knows is fine).
-        """
-        target = mesh.strip()
-        found: Mesh | None = None
-        try:
-            _uuid.UUID(target)
-            is_uuid = True
-        except ValueError:
-            is_uuid = False
-        mine = self.list_mine()          # fetch once, not twice
-        for m in mine:
-            if (is_uuid and m.id == target) or m.name == target:
-                found = m
-                break
-        if found is None:
-            low = target.lower()
-            for m in mine:
-                if m.name.lower() == low:
-                    found = m
-                    break
-        if found is None:
-            raise MeshbookError("mesh_not_found", f"No mesh matching {mesh!r}.", 404)
-        if verify:
-            # Raises token_out_of_scope (403) rather than handing back a Mesh
-            # whose every later request would fail. Nothing local has changed
-            # at this point, so the caller's current mesh still works.
-            self._c.request("POST", "/api/meshes/active", body={"meshId": found.id})
-        self._c.active_mesh_id = found.id
-        return found
-
-    def members(self, mesh: str | None = None) -> dict:
-        """Who is in a mesh: members, plus pending invites and join requests.
-
-        Added 2026-08-20 (Wren, report A6). Every client could ACT on
-        membership and none could SEE it. No new endpoint was needed --
-        ``GET /api/meshes/<id>/detail`` has carried the roster all along,
-        gated on membership.
-
-        Returns ``{"mesh", "meshId", "count", "members", "pendingInvites",
-        "pendingRequests"}`` -- an explicit count, so "found zero" and
-        "silently did nothing" cannot look the same to a caller.
-        """
-        mesh_id = self.use(mesh, verify=False).id if mesh else self._c.active_mesh_id
-        if not mesh_id:
-            raise MeshbookError(
-                "no_active_mesh",
-                "No active mesh. Call meshes.use(...) first, or pass a mesh.",
-                400,
-            )
-        data = self._c._get_data(f"/api/meshes/{mesh_id}/detail") or {}
-        members = data.get("members") or []
-        return {
-            "mesh": (data.get("mesh") or {}).get("name"),
-            "meshId": mesh_id,
-            "count": len(members),
-            "members": members,
-            "pendingInvites": data.get("pendingInvites") or [],
-            "pendingRequests": data.get("pendingRequests") or [],
-        }
-
-
-class _Contacts(_Namespace):
-    def list(self, q: str | None = None, limit: int = 50) -> list[dict]:
-        """GET /api/contacts — contact dicts (displayName, primaryEmail, …)."""
-        return self._c._get_items("/api/contacts", {"limit": limit, "search": q})
-
-    def create(
-        self,
-        first_name: str,
-        last_name: str | None = None,
-        email: str | None = None,
-        company: str | None = None,
-    ) -> dict:
-        """POST /api/contacts. `company` is free text, resolved
-        server-side (§22c) — check `primaryCompanyId` on the result to
-        see whether it matched."""
-        body: dict = {"firstName": first_name, "lastName": last_name}
-        if email:
-            body["primaryEmail"] = email
-        if company:
-            body["company"] = company
-        return _data(self._c.request("POST", "/api/contacts", body=body))
-
-
-class _Leads(_Namespace):
-    def list(
-        self,
-        limit: int = 50,
-        pipeline_id: str | None = None,
-        stage_id: str | None = None,
-        company_id: str | None = None,
-    ) -> list[dict]:
-        """GET /api/leads — lead dicts (title, valueAmount, stageName, …)."""
-        params = {
-            "limit": limit,
-            "pipelineId": pipeline_id,
-            "stageId": stage_id,
-            "companyId": company_id,
-        }
-        return self._c._get_items("/api/leads", params)
-
-    def create(
-        self,
-        title: str,
-        pipeline_id: str,
-        stage_id: str,
-        value: float | None = None,
-        description: str | None = None,
-    ) -> dict:
-        body: dict = {"title": title, "pipelineId": pipeline_id, "stageId": stage_id}
-        if value is not None:
-            body["valueAmount"] = value
-        if description:
-            body["description"] = description
-        return _data(self._c.request("POST", "/api/leads", body=body))
-
-    def move_stage(self, lead_id: str, stage_id: str) -> dict:
-        """POST /api/leads/{id}/move-stage."""
-        return _data(
-            self._c.request(
-                "POST", f"/api/leads/{lead_id}/move-stage", body={"stageId": stage_id}
-            )
-        )
-
-
-class _Tasks(_Namespace):
-    def list(
-        self,
-        limit: int = 50,
-        project_id: str | None = None,
-        assignee_id: str | None = None,
-        status: str | None = None,
-    ) -> list[dict]:
-        """GET /api/tasks. Status values: NotStarted / InProgress /
-        Blocked / Review / Done / Cancelled."""
-        params = {
-            "limit": limit,
-            "projectId": project_id,
-            "assigneeId": assignee_id,
-            "status": status,
-        }
-        return self._c._get_items("/api/tasks", params)
-
-    def list_mine(self, status: str | None = None, limit: int = 50) -> list[dict]:
-        """Tasks assigned to the signed-in user (resolves own id via
-        /api/me, cached for the client's lifetime)."""
-        return self.list(limit=limit, assignee_id=self._c._self_user_id(), status=status)
-
-    def create(
-        self,
-        project_id: str,
-        title: str,
-        priority: str | None = None,
-        description: str | None = None,
-    ) -> dict:
-        body: dict = {"projectId": project_id, "title": title}
-        if priority:
-            body["priority"] = priority
-        if description:
-            body["description"] = description
-        return _data(self._c.request("POST", "/api/tasks", body=body))
-
-    def done(self, task_id: str, status: str = "Done") -> dict:
-        """PATCH /api/tasks/{id} → terminal status (default Done;
-        pass e.g. status='Cancelled' for another terminal)."""
-        return _data(
-            self._c.request("PATCH", f"/api/tasks/{task_id}", body={"status": status})
-        )
-
-
-class _Chat(_Namespace):
-    """Entity chat on the ACTIVE MESH (the mesh-wide room). For named
-    channels and DMs use ``client.channels``."""
-
-    def post(self, message: str, reply_to: str | None = None) -> dict:
-        """POST /api/entities/mesh/{active}/chat. `reply_to` threads the
-        message under an existing message's UUID (parentMessageId)."""
-        mesh_id = self._c._require_mesh()
-        body: dict = {"bodyMd": message}
-        if reply_to:
-            body["parentMessageId"] = reply_to
-        return _data(
-            self._c.request("POST", f"/api/entities/mesh/{mesh_id}/chat", body=body)
-        )
-
-    def list(self, limit: int = 20) -> list[dict]:
-        """GET /api/entities/mesh/{active}/chat — newest first."""
-        mesh_id = self._c._require_mesh()
-        return self._c._get_items(f"/api/entities/mesh/{mesh_id}/chat", {"limit": limit})
-
-    def search(self, q: str, limit: int = 20) -> dict:
-        """§84 hybrid keyword+semantic search over everything readable in
-        the active mesh (feed, entity threads, channels, your own DMs).
-
-        Returns ``{"items": [...], "semantic": bool, "total": int}`` —
-        ``semantic`` is False when the server's embedding arm was down and
-        recall was keyword-only (still valid results, just narrower).
-        """
-        self._c._require_mesh()
-        data = self._c._get_data("/api/chat/search", {"q": q, "limit": limit}) or {}
-        return {
-            "items": data.get("items", []),
-            "semantic": bool(data.get("semantic")),
-            "total": data.get("total", len(data.get("items", []))),
-        }
-
-    def attach(
-        self,
-        message_id: str,
-        file_path: str | os.PathLike,
-        filename: str | None = None,
-        mime: str | None = None,
-    ) -> Attachment:
-        """Attach a local file to an existing chat message via the
-        §26d-json endpoint (base64 in, no multipart)."""
-        path = Path(file_path)
-        raw = path.read_bytes()
-        if not raw:
-            raise MeshbookError("empty_file", f"File is empty: {path}")
-        body = {
-            "filename": filename or path.name,
-            "mimeType": mime or mimetypes.guess_type(str(path))[0] or "application/octet-stream",
-            "base64Bytes": base64.b64encode(raw).decode("ascii"),
-        }
-        data = _data(
-            self._c.request(
-                "POST", f"/api/chat-messages/{message_id}/attachments/json", body=body
-            )
-        )
-        return Attachment.from_api(data or {})
-
-    def download(
-        self, attachment_id: str, out_path: str | os.PathLike | None = None
-    ) -> Path:
-        """Download a chat attachment. Returns the written Path
-        (server-supplied filename in cwd when out_path is omitted;
-        out_path may be a directory)."""
-        return self._c._download_to(
-            f"/api/chat-attachments/{attachment_id}/download", out_path
-        )
-
-    def react(self, message_id: str, emoji: str) -> dict:
-        """POST /api/chat-messages/{id}/reactions — works for entity,
-        channel, and DM messages alike."""
-        return _data(
-            self._c.request(
-                "POST", f"/api/chat-messages/{message_id}/reactions", body={"emoji": emoji}
-            )
-        )
-
-
-class _Channels(_Namespace):
-    def list(self) -> list[dict]:
-        """GET /api/meshes/{active}/channels — channel dicts
-        (name, channelType, unreadCount, …)."""
-        mesh_id = self._c._require_mesh()
-        return self._c._get_items(f"/api/meshes/{mesh_id}/channels")
-
-    def _resolve(self, channel: str) -> dict:
-        """Channel ref → row. Accepts a raw UUID or a name (leading '#'
-        stripped, case-insensitive) within the active mesh."""
-        target = channel.lstrip("#").strip()
-        if not target:
-            raise MeshbookError("bad_channel", "Empty channel reference.")
-        try:
-            _uuid.UUID(target)
-            detail = self._c._get_data(f"/api/channels/{target}")
-            if detail:
-                return detail
-            raise MeshbookError("channel_not_found", f"No channel {channel!r}.", 404)
-        except ValueError:
-            pass
-        low = target.lower()
-        for ch in self.list():
-            if (ch.get("name") or "").lower() == low:
-                return ch
-        raise MeshbookError(
-            "channel_not_found", f"No channel matching {channel!r} in active mesh.", 404
-        )
-
-    def read(self, channel: str, limit: int = 20) -> list[dict]:
-        """GET /api/channels/{id}/messages — newest first."""
-        ch = self._resolve(channel)
-        return self._c._get_items(f"/api/channels/{ch['id']}/messages", {"limit": limit})
-
-    def post(self, channel: str, message: str, reply_to: str | None = None) -> dict:
-        """POST /api/channels/{id}/messages. Broadcast channels are
-        admin-post-only server-side (403 → MeshbookError)."""
-        ch = self._resolve(channel)
-        body: dict = {"bodyMd": message}
-        if reply_to:
-            body["parentMessageId"] = reply_to
-        return _data(
-            self._c.request("POST", f"/api/channels/{ch['id']}/messages", body=body)
-        )
-
-    def members(self, channel: str) -> list[dict]:
-        """§88a — a channel's member list (for private channels: the
-        access list; the server refuses for channels you can't see)."""
-        ch = self._resolve(channel)
-        return self._c._get_items(f"/api/channels/{ch['id']}/members")
-
-    def add_member(self, channel: str, user_id: str) -> list[dict]:
-        """§88a — add a mesh member (channel creator / mesh admin only)."""
-        ch = self._resolve(channel)
-        payload = self._c.request(
-            "POST", f"/api/channels/{ch['id']}/members", body={"userId": user_id}
-        )
-        data = _data(payload) or {}
-        return data.get("items", []) if isinstance(data, dict) else []
-
-    def remove_member(self, channel: str, user_id: str) -> dict:
-        """§88a — remove a member (creator/admin, or yourself to leave)."""
-        ch = self._resolve(channel)
-        return _data(
-            self._c.request(
-                "DELETE", f"/api/channels/{ch['id']}/members/{user_id}"
-            )
-        )
-
-
-class _Notifications(_Namespace):
-    def list(self) -> list[dict]:
-        """GET /api/notifications — notification dicts (kind, summary,
-        readAt, createdAt, …)."""
-        return self._c._get_items("/api/notifications")
-
-
-class _Files(_Namespace):
-    """Entity attachments (§78) — files on any entity:
-    company | contact | lead | project | task | portfolio |
-    calendar_event | mesh."""
-
-    def attach(
-        self,
-        entity_type: str,
-        entity_id: str,
-        file_path: str | os.PathLike,
-        filename: str | None = None,
-        mime: str | None = None,
-    ) -> Attachment:
-        """POST /api/entities/{type}/{id}/attachments/json (base64)."""
-        path = Path(file_path)
-        raw = path.read_bytes()
-        if not raw:
-            raise MeshbookError("empty_file", f"File is empty: {path}")
-        body = {
-            "filename": filename or path.name,
-            "mimeType": mime or mimetypes.guess_type(str(path))[0] or "application/octet-stream",
-            "base64Bytes": base64.b64encode(raw).decode("ascii"),
-        }
-        data = _data(
-            self._c.request(
-                "POST", f"/api/entities/{entity_type}/{entity_id}/attachments/json", body=body
-            )
-        )
-        return Attachment.from_api(data or {})
-
-    def list(self, entity_type: str, entity_id: str) -> list[dict]:
-        """GET /api/entities/{type}/{id}/attachments — dicts with
-        kind='file' (filename/byteSize/mimeType) or kind='link'
-        (externalUrl)."""
-        return self._c._get_items(f"/api/entities/{entity_type}/{entity_id}/attachments")
-
-    def download(
-        self, attachment_id: str, out_path: str | os.PathLike | None = None
-    ) -> Path:
-        """Download an entity attachment; returns the written Path."""
-        return self._c._download_to(
-            f"/api/entity-attachments/{attachment_id}/download", out_path
-        )
-
-    def delete(self, attachment_id: str) -> dict:
-        """DELETE /api/entity-attachments/{id} (uploader or mesh admin)."""
-        return _data(
-            self._c.request("DELETE", f"/api/entity-attachments/{attachment_id}")
-        )
-
-
-class _Exports(_Namespace):
-    """Mesh data exports (§58). Admin/account-manager only; exports
-    expire after 24 h server-side."""
-
-    def start(self, mesh_id: str) -> ExportJob:
-        """POST /api/meshes/{id}/export — start (or return the in-flight)
-        export job. The server requires mesh_id == your active mesh;
-        this method sends the matching X-Active-Mesh-Id automatically."""
-        prev = self._c.active_mesh_id
-        self._c.active_mesh_id = mesh_id
-        try:
-            data = _data(self._c.request("POST", f"/api/meshes/{mesh_id}/export"))
-        finally:
-            self._c.active_mesh_id = prev
-        return ExportJob.from_api(data or {})
-
-    def list(self, mesh_id: str) -> list[ExportJob]:
-        """GET /api/meshes/{id}/exports — recent jobs, newest first.
-        Poll until status == 'ready', then download."""
-        items = self._c._get_items(f"/api/meshes/{mesh_id}/exports")
-        return [ExportJob.from_api(d) for d in items]
-
-    def download(self, export_id: str, out_path: str | os.PathLike) -> Path:
-        """GET /api/mesh-exports/{id}/download → zip written to out_path
-        (a directory keeps the server filename). 409 while not ready,
-        410 once expired — both raise MeshbookError with that status."""
-        return self._c._download_to(
-            f"/api/mesh-exports/{export_id}/download", out_path
-        )
+def _close_quietly(e: urllib.error.HTTPError) -> None:
+    try:
+        e.close()
+    except Exception:
+        pass
