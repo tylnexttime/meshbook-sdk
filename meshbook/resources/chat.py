@@ -78,10 +78,13 @@ class Chat(Namespace):
         entity_id: str | None = None,
         mesh: str | None = None,
     ) -> ItemList[dict[str, Any]]:
-        """GET /api/entities/{type}/{id}/chat — newest first.
+        """GET /api/entities/{type}/{id}/chat — the newest ``limit``
+        messages, returned oldest first (chronological, as the server sends
+        them; the last item is the most recent).
 
         Pages by cursor: ``before`` (an aware datetime or ISO string, e.g.
-        the oldest row's ``createdAt``) loads messages older than it.
+        the first row's ``createdAt``, the oldest on the page) loads the
+        messages older than it. ``has_more`` is the server's own ``hasMore``.
         ``offset=`` raises ``bad_argument`` (the server ignores it; 0.4.0
         sent it and silently returned the first page again).
         """
@@ -281,8 +284,9 @@ class Channels(Namespace):
         before: Any = None,
         mesh: str | None = None,
     ) -> ItemList[dict[str, Any]]:
-        """GET /api/channels/{id}/messages — newest first. Pages by
-        ``before`` as :meth:`Chat.list`; ``offset=`` raises ``bad_argument``."""
+        """GET /api/channels/{id}/messages — the newest ``limit`` messages,
+        oldest first (the last item is the most recent). Pages by ``before``
+        as :meth:`Chat.list`; ``offset=`` raises ``bad_argument``."""
         no_offset(offset, "channels.read()")
         channel_id = self._channel_id(channel, mesh)
         return self._c._list(
@@ -418,8 +422,9 @@ class Dms(Namespace):
         before: Any = None,
         mesh: str | None = None,
     ) -> ItemList[dict[str, Any]]:
-        """Messages in your DM thread with *user* — newest first. Pages by
-        ``before`` as :meth:`Chat.list`; ``offset=`` raises ``bad_argument``."""
+        """Messages in your DM thread with *user*: the newest ``limit``,
+        oldest first (the last item is the most recent). Pages by ``before``
+        as :meth:`Chat.list`; ``offset=`` raises ``bad_argument``."""
         no_offset(offset, "dms.read()")
         dm = self.open(user, mesh=mesh)
         return self._c._list(

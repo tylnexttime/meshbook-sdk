@@ -360,3 +360,70 @@ def test_real_zoneinfo_when_this_machine_has_one():
     assert recurrence_rule("weekly", tzid="Australia/Sydney")["tzid"] == "Australia/Sydney"
     with pytest.raises(MeshbookError):
         recurrence_rule("weekly", tzid="Mars/Olympus")
+
+
+# ─── 3. ItemList.has_more honours the server's hasMore ─────────────────
+
+from meshbook.models import ItemList  # noqa: E402
+
+CHAT = f"/api/entities/mesh/{MESH}/chat"
+CH = "cccccccc-1111-1111-1111-000000000001"
+
+
+def _msgs(n):
+    return [{"id": f"m{i}", "createdAt": f"2026-10-19T10:{i:02d}:00+00:00"} for i in range(n)]
+
+
+def test_a_full_chat_page_with_hasmore_false_is_the_last_page(ev_client, monkeypatch):
+    """Exactly `limit` messages left: the page arithmetic said "more", the
+    server (which peeks one extra row) says no."""
+    r = install(monkeypatch)
+    r.add("GET", CHAT, ok({"items": _msgs(20), "pinned": [], "hasMore": False}))
+    assert ev_client.chat.list(limit=20).has_more is False
+
+
+def test_a_default_limit_chat_page_with_hasmore_true_says_more(ev_client, monkeypatch):
+    """No limit sent: the server applies the mesh default (typically 100)
+    and says hasMore; the arithmetic had nothing to compare against."""
+    r = install(monkeypatch)
+    r.add("GET", CHAT, ok({"items": _msgs(5), "pinned": [], "hasMore": True}))
+    assert ev_client.chat.list(limit=None).has_more is True
+
+
+def test_channel_pages_honour_hasmore_too(ev_client, monkeypatch):
+    r = install(monkeypatch)
+    r.add("GET", f"/api/channels/{CH}/messages",
+          ok({"items": _msgs(3), "pinned": [], "hasMore": False}))
+    assert ev_client.channels.read(CH, limit=3).has_more is False
+
+
+def test_itemlist_has_more_rules():
+    assert ItemList([1, 2], limit=2, meta={"hasMore": False}).has_more is False
+    assert ItemList([1], limit=5, meta={"hasMore": True}).has_more is True
+    # not a bool: ignored, the arithmetic decides
+    assert ItemList([1, 2], limit=2, meta={"hasMore": None}).has_more is True
+    assert ItemList([1, 2], limit=2, meta={"hasMore": "no"}).has_more is True
+    # the SDK cut a page client-side: rows it holds back still count as more
+    assert ItemList([1, 2], total=5, limit=2, offset=0,
+                    meta={"hasMore": False, "client_paginated": True}).has_more is True
+
+
+# ─── 4. chat order: oldest first, as the server sends it ───────────────
+
+
+def test_chat_reads_keep_the_servers_oldest_first_order(ev_client, monkeypatch):
+    r = install(monkeypatch)
+    rows = _msgs(3)
+    r.add("GET", CHAT, ok({"items": rows, "pinned": [], "hasMore": False}))
+    r.add("GET", f"/api/channels/{CH}/messages", ok({"items": rows, "hasMore": False}))
+    assert [m["id"] for m in ev_client.chat.list()] == ["m0", "m1", "m2"]
+    assert [m["id"] for m in ev_client.channels.read(CH)] == ["m0", "m1", "m2"]
+
+
+def test_chat_docstrings_say_oldest_first():
+    from meshbook.resources.chat import Channels, Chat, Dms
+
+    for fn in (Chat.list, Channels.read, Dms.read):
+        doc = fn.__doc__ or ""
+        assert "newest first" not in doc, fn.__qualname__
+        assert "oldest first" in doc, fn.__qualname__

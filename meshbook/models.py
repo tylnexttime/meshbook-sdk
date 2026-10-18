@@ -79,13 +79,24 @@ class ItemList(list[T], Generic[T]):
     def has_more(self) -> bool:
         """Best available answer to "is there another page?".
 
-        True when the server's ``total`` exceeds what has been read so far,
-        or when a full page came back (``len == limit``) — the server
-        reports the page length as ``total`` on many endpoints, so a full
-        page is the only signal those give.
+        When the server says it itself (a boolean ``hasMore``, as the chat,
+        channel and DM routes send: they peek one row past the page), that
+        answer wins, unless the SDK cut the page client-side and still holds
+        rows back. Otherwise: True when the server's ``total`` exceeds what
+        has been read so far, or when a full page came back (``len ==
+        limit``), since the server reports the page length as ``total`` on
+        many endpoints and a full page is the only signal those give.
         """
         start = self.offset or 0
         consumed = self._server_rows
+        server_says = self.meta.get("hasMore")
+        if isinstance(server_says, bool):
+            held_back = (
+                bool(self.meta.get("client_paginated"))
+                and self.total is not None
+                and self.total > start + consumed
+            )
+            return server_says or held_back
         if self.total is not None and self.total > start + consumed:
             return True
         if self.meta.get("server_total") is not None:
