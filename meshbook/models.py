@@ -9,7 +9,7 @@ from __future__ import annotations
 import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Generic, SupportsIndex, TypeVar, overload
+from typing import Any, Generic, NamedTuple, SupportsIndex, TypeVar, overload
 
 T = TypeVar("T")
 
@@ -113,6 +113,20 @@ class SearchResults(ItemList[dict[str, Any]]):
         return super().__getitem__(key)
 
 
+class DownloadedFile(NamedTuple):
+    """A download held in memory: ``download_bytes()``'s result.
+
+    Unpacks as ``filename, content = ...``. ``filename`` is the server's
+    Content-Disposition name already reduced by :func:`meshbook.safe_filename`
+    (a single safe path component, never ``..`` or a device name), so a
+    caller can join it onto its own directory; it is still the uploader's
+    choice, so check containment if you write it somewhere that matters.
+    """
+
+    filename: str
+    content: bytes
+
+
 @dataclass(frozen=True)
 class User:
     id: str
@@ -193,4 +207,4 @@ class Attachment:
         )
 
 
-__all__ = ["Attachment", "ExportJob", "ItemList", "Mesh", "SearchResults", "User"]
+__all__ = ["Attachment", "DownloadedFile", "ExportJob", "ItemList", "Mesh", "SearchResults", "User"]

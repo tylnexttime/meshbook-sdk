@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import MeshbookError
-from ..models import Attachment, ExportJob, ItemList
+from ..models import Attachment, DownloadedFile, ExportJob, ItemList
 from ._base import Namespace, as_dict
 from .chat import _file_body
 
@@ -107,10 +107,26 @@ class Files(Namespace):
         out_path: str | os.PathLike[str] | None = None,
         *,
         mesh: str | None = None,
+        overwrite: bool = False,
     ) -> Path:
-        """Download an entity attachment; returns the written Path."""
+        """Download an entity attachment; returns the written Path.
+
+        out_path, ``overwrite`` and the safety rules as
+        :meth:`Chat.download <meshbook.resources.chat.Chat.download>`.
+        """
         return self._c._download(
-            "files.download", path={"attachment_id": attachment_id}, out_path=out_path, mesh=mesh
+            "files.download",
+            path={"attachment_id": attachment_id},
+            out_path=out_path,
+            mesh=mesh,
+            overwrite=overwrite,
+        )
+
+    def download_bytes(self, attachment_id: str, *, mesh: str | None = None) -> DownloadedFile:
+        """An entity attachment in memory: ``(filename, content)``, the
+        filename already sanitised. Nothing is written to disk."""
+        return self._c._download_bytes(
+            "files.download", path={"attachment_id": attachment_id}, mesh=mesh
         )
 
     def delete(self, attachment_id: str, *, mesh: str | None = None) -> dict[str, Any]:
@@ -164,13 +180,30 @@ class Exports(Namespace):
             meta=rows.meta,
         )
 
-    def download(self, export_id: str, out_path: str | os.PathLike[str] | None = None) -> Path:
+    def download(
+        self,
+        export_id: str,
+        out_path: str | os.PathLike[str] | None = None,
+        *,
+        mesh: str | None = None,
+        overwrite: bool = False,
+    ) -> Path:
         """GET /api/mesh-exports/{id}/download → zip written to out_path
-        (a directory keeps the server filename). 409 while not ready, 410
-        once expired — both raise MeshbookError with that status."""
+        (a directory keeps the server filename, sanitised). 409 while not
+        ready, 410 once expired — both raise MeshbookError with that status.
+        An existing file raises ``file_exists`` unless ``overwrite=True``."""
         return self._c._download(
-            "exports.download", path={"export_id": export_id}, out_path=out_path
+            "exports.download",
+            path={"export_id": export_id},
+            out_path=out_path,
+            mesh=mesh,
+            overwrite=overwrite,
         )
+
+    def download_bytes(self, export_id: str, *, mesh: str | None = None) -> DownloadedFile:
+        """An export zip in memory: ``(filename, content)``, the filename
+        already sanitised. Nothing is written to disk."""
+        return self._c._download_bytes("exports.download", path={"export_id": export_id}, mesh=mesh)
 
 
 class CustomFields(Namespace):

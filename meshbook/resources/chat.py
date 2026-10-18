@@ -9,7 +9,7 @@ from typing import Any
 
 from ..client import _is_uuid
 from ..errors import MeshbookError
-from ..models import Attachment, ItemList, SearchResults
+from ..models import Attachment, DownloadedFile, ItemList, SearchResults
 from ._base import Namespace, as_dict, put_if
 
 
@@ -135,11 +135,29 @@ class Chat(Namespace):
         out_path: str | os.PathLike[str] | None = None,
         *,
         mesh: str | None = None,
+        overwrite: bool = False,
     ) -> Path:
-        """Download a chat attachment. Returns the written Path (server
-        filename in cwd when out_path is omitted; out_path may be a dir)."""
+        """Download a chat attachment. Returns the written Path.
+
+        No out_path → the server's filename in the current directory; a
+        directory → the server's filename inside it (sanitised, and refused
+        with ``unsafe_path`` if it would land anywhere else); a file path →
+        that file. An existing file raises ``file_exists`` unless
+        ``overwrite=True``. Written atomically.
+        """
         return self._c._download(
-            "chat.download", path={"attachment_id": attachment_id}, out_path=out_path, mesh=mesh
+            "chat.download",
+            path={"attachment_id": attachment_id},
+            out_path=out_path,
+            mesh=mesh,
+            overwrite=overwrite,
+        )
+
+    def download_bytes(self, attachment_id: str, *, mesh: str | None = None) -> DownloadedFile:
+        """A chat attachment in memory: ``(filename, content)``, the filename
+        already sanitised. Nothing is written to disk."""
+        return self._c._download_bytes(
+            "chat.download", path={"attachment_id": attachment_id}, mesh=mesh
         )
 
     def react(self, message_id: str, emoji: str, *, mesh: str | None = None) -> dict[str, Any]:

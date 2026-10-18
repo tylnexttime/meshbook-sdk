@@ -15,9 +15,18 @@ from meshbook.client import (
     VERSION,
     Client,
     MeshbookClient,
+    safe_filename,
 )
 from meshbook.errors import MeshbookError
-from meshbook.models import Attachment, ExportJob, ItemList, Mesh, SearchResults, User
+from meshbook.models import (
+    Attachment,
+    DownloadedFile,
+    ExportJob,
+    ItemList,
+    Mesh,
+    SearchResults,
+    User,
+)
 from meshbook.resources import UNSET, recurrence_rule
 
 __version__ = VERSION
@@ -26,6 +35,7 @@ __all__ = [
     "VERSION",
     "Attachment",
     "Client",
+    "DownloadedFile",
     "ExportJob",
     "ItemList",
     "Mesh",
@@ -35,4 +45,5 @@ __all__ = [
     "User",
     "config",
     "recurrence_rule",
+    "safe_filename",
 ]

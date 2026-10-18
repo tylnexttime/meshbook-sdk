@@ -29,7 +29,10 @@ import email.utils
 import json
 import logging
 import os
+import re
+import tempfile
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -41,7 +44,15 @@ from typing import Any, TypeVar
 from . import config as _config
 from ._endpoints import ENDPOINTS, Endpoint
 from .errors import MeshbookError
-from .models import Attachment, ExportJob, ItemList, Mesh, SearchResults, User
+from .models import (
+    Attachment,
+    DownloadedFile,
+    ExportJob,
+    ItemList,
+    Mesh,
+    SearchResults,
+    User,
+)
 
 # Read from the INSTALLED package metadata, never hardcoded. A literal here
 # goes stale the moment pyproject is bumped, and the value rides on every
@@ -81,6 +92,7 @@ __all__ = [
     "VERSION",
     "Attachment",
     "Client",
+    "DownloadedFile",
     "ExportJob",
     "ItemList",
     "Mesh",
@@ -88,6 +100,7 @@ __all__ = [
     "MeshbookError",
     "SearchResults",
     "User",
+    "safe_filename",
 ]
 
 
@@ -198,17 +211,185 @@ def _sleep(seconds: float) -> None:
 _on_request: Callable[[str, str], None] | None = None
 
 
-def _filename_from_disposition(disp: str) -> str:
-    """Content-Disposition → filename; the RFC 5987 filename*= form wins."""
-    import re
+_DISP_EXT = re.compile(r"filename\*\s*=\s*([A-Za-z0-9!#$%&+^_`{}~.-]+)'[^']*'([^;\s]+)", re.I)
+_DISP_QUOTED = re.compile(r'filename\s*=\s*"((?:[^"\\]|\\.)*)"', re.I)
+_DISP_TOKEN = re.compile(r"filename\s*=\s*([^;\s\"]+)", re.I)
 
-    m = re.search(r"filename\*=UTF-8''([^;]+)", disp)
+
+def _filename_from_disposition(disp: str) -> str:
+    """Content-Disposition → the server's filename, UNSANITISED.
+
+    The RFC 5987 ``filename*=charset'lang'value`` form wins (charset and
+    parameter names case-insensitive), then a quoted ``filename="…"``, then
+    a bare token ``filename=…``. Returns ``"attachment"`` when none is
+    present. The result is attacker-influenced (an uploader chose it): pass
+    it through :func:`safe_filename` before it goes anywhere near a path.
+    """
+    m = _DISP_EXT.search(disp or "")
     if m:
-        return urllib.parse.unquote(m.group(1))
-    m = re.search(r'filename="([^"]+)"', disp)
+        charset = m.group(1).lower()
+        try:
+            return urllib.parse.unquote(m.group(2), encoding=charset, errors="replace")
+        except LookupError:  # unknown charset label
+            return urllib.parse.unquote(m.group(2), errors="replace")
+    m = _DISP_QUOTED.search(disp or "")
+    if m:
+        return re.sub(r"\\(.)", r"\1", m.group(1))
+    m = _DISP_TOKEN.search(disp or "")
     if m:
         return m.group(1)
     return "attachment"
+
+
+# ─── safe download names ───────────────────────────────────────────────
+
+#: Device names Windows reserves in every directory, with or without an
+#: extension (``CON``, ``con.txt`` and ``NUL.tar.gz`` all name the device).
+_WINDOWS_RESERVED = frozenset(
+    {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+    | {f"{dev}{n}" for dev in ("COM", "LPT") for n in "123456789\u00b9\u00b2\u00b3"}
+)
+#: Characters that are a separator, a drive/stream marker or invalid on
+#: Windows. Replaced on EVERY OS, so a name sanitises the same everywhere.
+_UNSAFE_CHARS = frozenset('<>:"/\\|?*')
+#: Longest name produced (bytes on most filesystems cap at 255).
+MAX_FILENAME = 200
+
+
+def safe_filename(name: str | None, fallback: str = "attachment") -> str:
+    """Reduce an untrusted filename (e.g. a server's Content-Disposition) to
+    a single safe path component. Pure string work: the same answer on
+    Windows and POSIX.
+
+    * Only the last component survives, splitting on BOTH ``/`` and ``\\``
+      (``../../x``, ``..\\..\\x``, ``C:\\x`` and ``/etc/passwd`` all lose
+      their directories).
+    * ``< > : " | ? *``, control characters (NUL included) and Unicode
+      format characters (the right-to-left override that disguises an
+      extension) become ``_``; ``C:x`` becomes ``C_x``.
+    * Leading and trailing dots and spaces are stripped (Windows drops the
+      trailing ones itself; leading ones hide a file or spell ``..``).
+    * A Windows device name (``CON``, ``nul.txt``, ``COM1`` …) gets a ``_``
+      prefix.
+    * Empty, ``.`` or ``..`` after all that → *fallback* (itself sanitised).
+    * At most :data:`MAX_FILENAME` characters, keeping a short extension.
+    """
+    text = unicodedata.normalize("NFC", str(name or ""))
+    text = re.split(r"[\\/]", text)[-1]
+    text = "".join(
+        "_"
+        if ch in _UNSAFE_CHARS or unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp")
+        else ch
+        for ch in text
+    )
+    text = text.strip(" .")
+    if not text:
+        if fallback == "attachment":
+            return "attachment"
+        return safe_filename(fallback)
+    stem = text.split(".", 1)[0].rstrip(" ")
+    if stem.upper() in _WINDOWS_RESERVED:
+        text = "_" + text
+    if len(text) > MAX_FILENAME:
+        root, dot, ext = text.rpartition(".")
+        if dot and root and 0 < len(ext) <= 16:
+            text = root[: MAX_FILENAME - len(ext) - 1].rstrip(" .") + "." + ext
+        else:
+            text = text[:MAX_FILENAME].rstrip(" .")
+    return text or "attachment"
+
+
+def _is_dir_hint(out_path: str | os.PathLike[str]) -> bool:
+    """True for an out_path that names a directory: an existing one, or a
+    string ending in a path separator (``"downloads/"``)."""
+    raw = os.fspath(out_path)
+    seps = tuple(s for s in (os.sep, os.altsep) if s)
+    return Path(raw).expanduser().is_dir() or (isinstance(raw, str) and raw.endswith(seps))
+
+
+def _download_target(
+    out_path: str | os.PathLike[str] | None, server_name: str | None
+) -> tuple[Path, Path | None]:
+    """(target file, containing dir or None) for a download.
+
+    With no out_path, or an out_path that is a directory, the file is named
+    by the server, so the name is sanitised and the resolved target must
+    sit DIRECTLY inside that directory (a symlink planted under the safe
+    name cannot redirect the write elsewhere): returns the directory as the
+    second element. An explicit file path is the caller's own choice and is
+    used as given (second element None).
+    """
+    if out_path is not None and not _is_dir_hint(out_path):
+        return Path(out_path).expanduser(), None
+    directory = Path(out_path).expanduser() if out_path is not None else Path.cwd()
+    return directory / safe_filename(server_name), directory
+
+
+def _assert_contained(target: Path, directory: Path) -> None:
+    root = directory.resolve()
+    resolved = target.resolve()
+    if resolved.parent != root:
+        raise MeshbookError(
+            "unsafe_path",
+            f"Refusing to write {target.name!r}: it resolves outside {root}.",
+        )
+
+
+def _refuse_existing(target: Path) -> None:
+    raise MeshbookError(
+        "file_exists",
+        f"{target} already exists; not overwritten.",
+    )
+
+
+def _atomic_write(target: Path, content: bytes, *, overwrite: bool) -> None:
+    """Write *content* to *target* via a temp file in the same directory.
+
+    ``overwrite=True`` → ``os.replace`` (atomic; replaces a symlink itself,
+    never writes through it). ``overwrite=False`` → a hard link, which fails
+    if anything (a file, a dangling symlink) appeared at *target* in the
+    meantime: an atomic no-clobber. Filesystems without hard links fall back
+    to check-then-replace. The temp file is always removed. OSErrors become
+    ``MeshbookError("write_failed")``.
+    """
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".meshbook-", suffix=".part", dir=target.parent)
+    except OSError as e:
+        raise MeshbookError("write_failed", f"Cannot write into {target.parent}: {e}") from e
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if overwrite:
+            os.replace(tmp, target)
+            return
+        try:
+            os.link(tmp, target)
+        except FileExistsError:
+            _refuse_existing(target)
+        except OSError:
+            # No hard links here (FAT, some network shares): best effort.
+            if os.path.lexists(target):
+                _refuse_existing(target)
+            os.replace(tmp, target)
+    except OSError as e:
+        raise MeshbookError("write_failed", f"Cannot write {target}: {e}") from e
+    finally:
+        try:
+            if os.path.lexists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _disposition(headers: Any) -> str:
+    """The Content-Disposition header of a raw response, or ``""``."""
+    try:
+        return str(headers.get("Content-Disposition", "") or "")
+    except Exception:
+        return ""
 
 
 def _err_fields(payload: Any, raw: str) -> tuple[str, str]:
@@ -734,14 +915,10 @@ class MeshbookClient:
         payload = self._call(key, path=path, params=query, mesh=mesh)
         return _item_list(payload, limit=limit, offset=offset, cls=cls)
 
-    def _download(
-        self,
-        key: str,
-        *,
-        path: Mapping[str, Any],
-        out_path: str | os.PathLike[str] | None,
-        mesh: str | None = None,
-    ) -> Path:
+    def _download_bytes(
+        self, key: str, *, path: Mapping[str, Any], mesh: str | None = None
+    ) -> DownloadedFile:
+        """GET a download route → :class:`DownloadedFile` (sanitised name, bytes)."""
         ep = ENDPOINTS[key]
         content, headers = self._send(
             ep.method,
@@ -750,18 +927,48 @@ class MeshbookClient:
             mesh_id=self._endpoint_mesh(ep, path, mesh),
             raw=True,
         )
-        disp = ""
-        try:
-            disp = headers.get("Content-Disposition", "") or ""
-        except Exception:
-            disp = ""
-        server_name = _filename_from_disposition(disp)
-        out = Path(out_path).expanduser() if out_path else Path(server_name)
-        if out.is_dir():
-            out = out / server_name
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_bytes(content)
-        return out
+        return DownloadedFile(
+            safe_filename(_filename_from_disposition(_disposition(headers))), bytes(content)
+        )
+
+    def _download(
+        self,
+        key: str,
+        *,
+        path: Mapping[str, Any],
+        out_path: str | os.PathLike[str] | None,
+        mesh: str | None = None,
+        overwrite: bool = False,
+    ) -> Path:
+        """Download and write to disk, safely.
+
+        * *out_path* ``None`` → the current directory; a directory (existing,
+          or a string ending in a separator) → the server's filename inside
+          it, reduced by :func:`safe_filename` and checked to resolve
+          directly inside that directory (``unsafe_path`` otherwise); any
+          other path → exactly that file.
+        * An existing file is never replaced unless ``overwrite=True``
+          (``file_exists``). An explicit file path is checked BEFORE the
+          request, so a refusal costs no download.
+        * Written atomically: a temp file in the target directory, then a
+          rename (``overwrite=True``) or a no-clobber hard link.
+        """
+        if out_path is not None and not overwrite and not _is_dir_hint(out_path):
+            early = Path(out_path).expanduser()
+            if os.path.lexists(early):
+                _refuse_existing(early)
+        got = self._download_bytes(key, path=path, mesh=mesh)
+        target, directory = _download_target(out_path, got.filename)
+        if directory is not None:
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                raise MeshbookError("write_failed", f"Cannot create {directory}: {e}") from e
+            _assert_contained(target, directory)
+        if not overwrite and os.path.lexists(target):
+            _refuse_existing(target)
+        _atomic_write(target, got.content, overwrite=overwrite)
+        return target
 
     def request(
         self,
@@ -796,18 +1003,17 @@ class MeshbookClient:
             mesh_id=mesh_id,
         )
 
-    def download_raw(self, path: str) -> tuple[bytes, str]:
+    def download_raw(self, path: str, *, mesh: str | None = None) -> tuple[bytes, str]:
         """Raw-bytes GET of any path (downloads are not JSON). Returns
-        ``(bytes, server_filename)`` from Content-Disposition when present."""
-        content, headers = self._send(
-            "GET", path, mesh_id=self.resolve_mesh(None), raw=True
-        )
-        disp = ""
-        try:
-            disp = headers.get("Content-Disposition", "") or ""
-        except Exception:
-            disp = ""
-        return content, _filename_from_disposition(disp)
+        ``(bytes, server_filename)`` from Content-Disposition when present.
+
+        The filename is the server's, UNSANITISED (0.3 behaviour, kept): run
+        it through :func:`meshbook.safe_filename` before using it in a path,
+        or use the namespaced ``download_bytes()`` methods, which do.
+        ``mesh=`` (id or name) sends that mesh instead of the client's.
+        """
+        content, headers = self._send("GET", path, mesh_id=self.resolve_mesh(mesh), raw=True)
+        return content, _filename_from_disposition(_disposition(headers))
 
     # ── identity ──────────────────────────────────────────────────────
 
