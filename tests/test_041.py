@@ -484,3 +484,23 @@ def test_non_default_base_and_mesh_sources_are_logged_once(tmp_path, monkeypatch
         d = MeshbookClient(token="t", config_path=tmp_path / "none")
     assert d.base_source == "default" and caplog.text == ""
 
+
+# ─── critique C-33: the docs describe the lock that shipped ────────────
+
+
+def test_docs_describe_the_os_advisory_lock():
+    import re
+    from pathlib import Path
+
+    import meshbook.config as cfgmod
+
+    root = Path(__file__).parent.parent
+    for name in ("README.md", "CHANGELOG.md"):
+        text = root / name
+        body = text.read_text(encoding="utf-8")
+        assert "stale locks broken" not in body, name
+        for para in re.split(r"\n\s*\n", body):
+            if "config.lock" in para:
+                assert "advisory" in para, f"{name}: a paragraph names config.lock without 'advisory'"
+    assert "advisory lock" in (cfgmod.__doc__ or "")
+    assert not hasattr(cfgmod, "_break_stale_lock")

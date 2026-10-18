@@ -3,6 +3,93 @@
 All notable changes to meshbook-sdk are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow [SemVer](https://semver.org/).
 
+## [0.4.1] - 2026-10-19
+
+A fast follow to 0.4.0: the gaps meshbook-mcp hit porting onto it, the
+competitive critique's "fix now" SDK items, and the bugs found on the way.
+
+### Security
+- **Downloads could write outside their directory and overwrote silently
+  (critique C-03).** `files.download`, `chat.download` and
+  `exports.download` joined the server's Content-Disposition filename, which
+  the uploader chooses, onto the output directory unchecked, so
+  `../../.bashrc` or an absolute name was an arbitrary file write, and any
+  existing file was replaced. Now the name is reduced by the new
+  `meshbook.safe_filename()` (one component, identical on Windows and
+  POSIX: no `..`, separators, drive or device names, control or format
+  characters), the resolved target must sit directly inside the directory
+  (`unsafe_path`; a planted symlink cannot redirect it), an existing file
+  raises `file_exists` unless `overwrite=True`, and the write is atomic.
+- **Redirects carried credentials across hosts and turned writes into GETs
+  (C-06).** A redirect is followed only for GET/HEAD to the same origin;
+  anything else raises `redirect_refused`. The base must be https
+  (`insecure_base`; plain http only for loopback).
+- **The agent lane could strand a seat (C-14).** The new private key is
+  written to `agent-key.pem.pending` before `enroll`/`register` and promoted
+  on success; a lost answer keeps it, `token()` falls back to it, and
+  `agent.recover_pending()` / `agent.discard_pending()` settle it.
+- **A briefly unparsable config lost the token (C-04).** A failed read or
+  parse is re-read under the lock; a file still broken is never written
+  over (`config_unreadable`); `config.quarantine_config()` is the explicit
+  repair (timestamped, never overwriting); `reset_config()` also removes
+  quarantined copies and temp files.
+
+### Added
+- `download_bytes()` on `files`, `chat` and `exports` →
+  `DownloadedFile(filename, content)`, the filename sanitised, nothing
+  written; `overwrite=` on every `download()`; `mesh=` on
+  `exports.download()` and `client.download_raw()`.
+- `MeshbookError.hint`: a stable machine hint per error (defaults by code
+  from `meshbook.errors.HINTS`); `meshbook.errors.LOCAL_CODES` and the
+  README's Errors table list every code the SDK raises (a test keeps them in
+  step with the code).
+- `client.me_id(refresh=False)`: your user id, cached per client.
+- `ItemList.total_exact` and `ItemList.next_offset`.
+- `before=` cursor on `chat.list`, `channels.read`, `dms.read`.
+- `meshbook.endpoints`: the endpoint registry, public and read-only, with
+  `path(key, **params)`.
+- `Mesh.env_override` on `meshes.use(persist=True)`'s result, plus a
+  `UserWarning`, when `MESHBOOK_MESH` names a different mesh.
+- `config.load_config(strict=True)`, `config.quarantine_config()`,
+  `client.config_error`, `client.base_source`; a non-default base and the
+  mesh source are logged once at INFO.
+
+### Changed
+- Downloads no longer overwrite an existing file by default (`overwrite=True`
+  to replace), and on POSIX a downloaded file is created mode 600 (the
+  atomic temp file's mode; 0.4.0 used the umask default).
+- `offset=` on `chat.list`, `channels.read`, `dms.read`, `chat.search` and
+  `users.list` raises `bad_argument`: those routes ignore it, so 0.4.0
+  silently returned the first page again.
+- An empty `mesh=""`, `active_mesh_id=""` or set-but-empty `MESHBOOK_MESH`
+  raises `bad_argument` instead of falling through to the persisted mesh
+  (C-10); a per-call `mesh=""` is `bad_argument` (was `mesh_not_found`).
+- A client whose config file is broken reports `config_unreadable` with the
+  path, not "No API token" (C-40).
+- `tasks.log_time()` defaults to the local date, not UTC (C-23).
+- `tasks.list_mine(open_only=True)`: with a non-terminal `status=` the server
+  filters; a terminal one is `bad_argument`; without `status=` the page is
+  filtered client-side and returns `total=None`, `meta["server_rows"]` and a
+  correct `has_more` / `next_offset`.
+- Channel methods given a UUID use it without a lookup GET.
+- Network failures while reading a response (timeout, reset, short read),
+  in the client and in the agent mint, are `network_error` (C-16); for a
+  write that may have been applied the hint is `check_before_retry`.
+
+### Fixed
+- `saved_views.list()` sent `entityType`, which the route does not read; it
+  sends `module` (`entity=` kept as a deprecated alias).
+- Content-Disposition parsing: a lower-case charset, a language tag, a bare
+  `filename=token` and escaped quotes now parse (a bare token read as
+  `attachment`).
+- An HTTP error whose body is cut off still raises its status, and the
+  error response is closed (the suite's ResourceWarning).
+- The CHANGELOG's 0.4.0 entry described the old lock; corrected (C-33).
+- README: upgrade notes from 0.3 and from 0.4.0 (C-20), downloads, errors,
+  the escape-hatch example (it used `entityType`).
+- Tests: the suite now fails on any query parameter the pinned spec does
+  not declare for its route.
+
 ## [0.4.0] - 2026-10-19
 
 The SDK becomes the single Python core: meshbook-cli 0.12 and meshbook-mcp 0.8
@@ -13,8 +100,12 @@ error-mapping, agent-lane and name-resolution code.
 - **`meshbook.config`** — the one owner of `~/.meshbook/config`: `config_dir()`,
   `config_path()`, `load_config()`, `save_config(updates)`, `reset_config()`.
   utf-8 (BOM tolerated), `schema_version: 1`, unknown keys preserved, `None`
-  deletes a key, atomic writes (temp + `os.replace`) under a `config.lock`
-  (best-effort, short timeout, stale locks broken), mode 600 on POSIX. A read
+  deletes a key, atomic writes (temp + `os.replace`) under an OS advisory
+  lock on `config.lock` (`fcntl.flock` / `msvcrt.locking`, released by the
+  OS if the holder dies, short timeout then `config_locked`; the lock file
+  is never deleted. Corrected in 0.4.1: this line first described an
+  earlier create/delete lock that broke "stale" locks by age, which is not
+  what shipped), mode 600 on POSIX. A read
   error during an update raises instead of writing back a config without the
   token; a corrupt file is kept as `config.bad`.
 - **Per-call mesh override (DEV-DEBT §102.1):** `mesh=` on every mesh-scoped
