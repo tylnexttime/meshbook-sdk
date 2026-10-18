@@ -191,6 +191,11 @@ class Mesh:
     mesh_type: str
     member_role: str
     raw: dict[str, Any] = field(repr=False)
+    #: Set only on ``meshes.use(..., persist=True)``'s result: the value of
+    #: ``MESHBOOK_MESH`` when it is set to a DIFFERENT mesh, which beats the
+    #: config file for every new client in that environment, so the mesh
+    #: just persisted will not be the one they use. None otherwise.
+    env_override: str | None = field(default=None, compare=False)
 
     @classmethod
     def from_api(cls, d: dict[str, Any]) -> Mesh:

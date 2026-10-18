@@ -1,6 +1,9 @@
 """Meshes, membership and the user directory."""
 from __future__ import annotations
 
+import dataclasses
+import os
+import warnings
 from typing import Any
 
 from .. import config as _config
@@ -58,6 +61,12 @@ class Meshes(Namespace):
         a library caller never rewrites a shared config file by accident.
 
         ``verify=False`` skips the server round-trip (offline use).
+
+        When ``persist=True`` and ``MESHBOOK_MESH`` is set to a different
+        mesh, new clients in this environment will still use
+        ``MESHBOOK_MESH`` (environment beats config): the returned Mesh then
+        carries ``env_override`` (the variable's value) and a
+        ``UserWarning`` is issued. This client uses *mesh* either way.
         """
         self._c._meshes_cache = None  # membership may have changed: refetch once
         found = self.resolve(mesh)
@@ -67,6 +76,16 @@ class Meshes(Namespace):
         self._c.mesh_source = "argument"
         if persist:
             _config.save_config({"active_mesh_id": found.id}, self._c.config_path)
+            env = (os.environ.get("MESHBOOK_MESH") or "").strip()
+            if env and env.lower() != found.id.lower() and env.casefold() != found.name.casefold():
+                warnings.warn(
+                    f"Saved {found.name or found.id} as the default mesh, but MESHBOOK_MESH="
+                    f"{env!r} is set and overrides the config for new clients in this "
+                    "environment.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                return dataclasses.replace(found, env_override=env)
         return found
 
     def members(self, mesh: str | None = None) -> dict[str, Any]:

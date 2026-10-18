@@ -395,3 +395,37 @@ def test_open_only_with_a_status_lets_the_server_filter(client, monkeypatch):
     with pytest.raises(MeshbookError) as ei:
         client.tasks.list_mine(status="Done", open_only=True)
     assert ei.value.code == "bad_argument"
+
+
+# ─── gap 8: meshes.use(persist=True) says when MESHBOOK_MESH will win ──
+
+
+def _two_meshes(monkeypatch):
+    from tests._fakes import MESH2, meshes_payload
+
+    r = install(monkeypatch)
+    r.add("GET", "/api/meshes", meshes_payload((MESH, "Home"), (MESH2, "Work")))
+    r.add("POST", "/api/meshes/active", ok({}))
+    return MESH2
+
+
+def test_persist_warns_and_flags_when_the_env_mesh_overrides(tmp_path, monkeypatch):
+    work = _two_meshes(monkeypatch)
+    c = MeshbookClient(token="t", mesh=MESH, config_path=tmp_path / "cfg")
+    monkeypatch.setenv("MESHBOOK_MESH", "Home")
+    with pytest.warns(UserWarning, match="MESHBOOK_MESH"):
+        m = c.meshes.use("Work", persist=True)
+    assert m.id == work and m.env_override == "Home"
+    assert c.active_mesh_id == work  # this client switched regardless
+
+
+def test_no_warning_when_env_agrees_or_nothing_is_persisted(tmp_path, monkeypatch, recwarn):
+    _two_meshes(monkeypatch)
+    c = MeshbookClient(token="t", mesh=MESH, config_path=tmp_path / "cfg")
+    monkeypatch.setenv("MESHBOOK_MESH", "work")
+    assert c.meshes.use("Work", persist=True).env_override is None  # same mesh, by name
+    monkeypatch.setenv("MESHBOOK_MESH", "Home")
+    assert c.meshes.use("Work").env_override is None  # not persisted: nothing to override
+    monkeypatch.delenv("MESHBOOK_MESH")
+    assert c.meshes.use("Work", persist=True).env_override is None
+    assert not [w for w in recwarn if issubclass(w.category, UserWarning)]
