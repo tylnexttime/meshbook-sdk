@@ -941,8 +941,12 @@ class MeshbookClient:
         token: str | None = None,
         mesh_id: str | None = None,
         raw: bool = False,
+        extra_headers: Mapping[str, str] | None = None,
     ) -> Any:
         """One logical request: auth, headers, 429/503 retries, one agent re-mint.
+
+        *extra_headers* ride on authenticated requests only (today: the C-01
+        ``X-Agent-Key-Proof``); they are never logged.
 
         Returns parsed JSON, or ``(bytes, headers)`` when *raw*.
         """
@@ -964,6 +968,8 @@ class MeshbookClient:
                 # Unauthenticated endpoints never carry the active mesh.
                 if mesh_id:
                     headers["X-Active-Mesh-Id"] = str(mesh_id)
+                if extra_headers:
+                    headers.update(extra_headers)
             if data is not None:
                 headers["Content-Type"] = "application/json"
             req = urllib.request.Request(url, data=data, method=method, headers=headers)
@@ -1052,6 +1058,7 @@ class MeshbookClient:
         params: Mapping[str, Any] | None = None,
         mesh: str | None = None,
         token: str | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> Any:
         """The ONLY way namespace code reaches the network: a registry key
         from :mod:`meshbook._endpoints`, never a free-form path."""
@@ -1064,6 +1071,7 @@ class MeshbookClient:
             require_auth=ep.auth,
             token=token,
             mesh_id=self._endpoint_mesh(ep, path, mesh),
+            extra_headers=headers,
         )
 
     def _list(

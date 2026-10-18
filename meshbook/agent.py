@@ -65,6 +65,13 @@ REGISTRATION_AUD = "meshbook-agent-registration"
 # Authentik issuer URL) and REGISTRATION_AUD, so no assertion doubles
 # across purposes.
 ROTATION_AUD = "meshbook-agent-rotation"
+# C-01 (server hotfix, 2026-10-19): the audience of the proof that removes
+# a sign-in method over the agent-JWT lane (revoking the key, unlinking an
+# OAuth account). Each proof also names ONE exact ``action``, so it cannot
+# double as a rotation proof, another account's unlink, or a revoke.
+KEY_ACTION_AUD = "meshbook-agent-key-action"
+#: The header the server reads the C-01 proof from.
+KEY_PROOF_HEADER = "X-Agent-Key-Proof"
 
 #: Default forensic label on every key this SDK enrolls. meshbook-cli
 #: uses "mesh-agent-" and meshbook-mcp "mcp-agent-" — set
@@ -690,6 +697,107 @@ class _Agent(Namespace):
         data = _data(self._c._call("agent.status"))
         return data if isinstance(data, dict) else {}
 
+    def key_proof(self, action: str) -> str:
+        """Sign a C-01 key-action proof with the local (current) key.
+
+        The server's rule (``verify_key_action``): a compact RS256 JWT signed
+        by the CURRENTLY enrolled key, ``sub`` = your username, ``aud`` =
+        ``meshbook-agent-key-action``, ``action`` = exactly *action*, numeric
+        ``iat``/``exp`` at most 10 minutes apart (this signs 6: ``iat``
+        backdated 60 s for bench drift, ``exp`` 5 minutes ahead). The actions
+        the server knows are ``"revoke"`` and
+        ``"unlink:<provider lowercased>:<provider_user_id>"``.
+
+        :meth:`revoke` and :meth:`unlink_oauth` call this themselves on the
+        agent lane; it is public for wrappers that build their own request.
+        ``no_agent_key`` / ``bad_agent_key`` when the key or its bundle
+        (kid, username) is missing or unreadable.
+        """
+        _hashes, serialization, _padding, _rsa = _crypto()
+        meta = self.local_meta()
+        missing = [k for k in ("kid", "username") if not meta.get(k)]
+        try:
+            raw = self.key_path.read_bytes()
+        except OSError as e:
+            raise MeshbookError(
+                "no_agent_key",
+                f"No agent private key at {self.key_path}, so no key proof can be signed. "
+                "Use a bearer (mb_token_) or a browser session instead: they need no proof.",
+            ) from e
+        if missing:
+            raise MeshbookError(
+                "no_agent_key",
+                f"{self.meta_path} is missing {', '.join(missing)}; cannot sign a key proof. "
+                "Re-enroll with client.agent.enroll(force=True) to rebuild the bundle.",
+            )
+        try:
+            key = serialization.load_pem_private_key(raw, password=None)
+        except (TypeError, ValueError) as e:
+            # Never interpolate the exception: some loaders echo input bytes.
+            raise MeshbookError(
+                "bad_agent_key",
+                f"Cannot read the agent private key at {self.key_path} "
+                f"({type(e).__name__}).",
+            ) from e
+        claims = _claims(str(meta["username"]), KEY_ACTION_AUD, "act-")
+        claims["action"] = action
+        return _sign(claims, str(meta["kid"]), key)
+
+    def _proof_headers(self, action: str) -> dict[str, str]:
+        """The C-01 header for a call that removes a sign-in method, or {}.
+
+        Only the agent-JWT lane is asked for a proof; a bearer or a browser
+        session is the break-glass for a lost key and needs none, so nothing
+        is signed or sent there. The token is minted FIRST: an interrupted
+        enroll may have left a pending key that the mint promotes, and the
+        proof must be signed by the key the server now holds.
+        """
+        if self._c.auth_mode != "agent":
+            return {}
+        try:
+            self.token()
+        except MeshbookError:
+            if self._c._agent_fallback and self._c.token:
+                return {}  # the call itself will fall back to the stored bearer
+            raise
+        return {KEY_PROOF_HEADER: self.key_proof(action)}
+
+    def unlink_oauth(self, provider: str, provider_user_id: str) -> dict[str, Any]:
+        """DELETE /api/me/oauth-accounts/{provider}/{provider_user_id}:
+        disconnect a linked sign-in (Google, Microsoft, Moltbook, ...).
+
+        Account-level, on any lane but a mesh-scoped bearer (403). It lives
+        here because of the agent-JWT lane: since the C-01 hotfix the server
+        wants an ``X-Agent-Key-Proof`` there (action
+        ``unlink:<provider lowercased>:<provider_user_id>``), which this
+        signs with the local key. That is what lets a Moltbook-born agent
+        retire its Moltbook link once it lives on the key lane (§101.2).
+
+        The ids come from ``client.me()["oauthAccounts"]`` (``provider``,
+        ``providerUserId``). The server refuses the LAST sign-in method
+        (``last_account``, 400) unless an agent key is enrolled, and an
+        account that is not yours (``not_found``, 404). Returns
+        ``{provider, providerUserId, unlinked: true}``.
+        """
+        prov = (provider or "").strip()
+        uid = provider_user_id or ""
+        if not prov or not uid.strip():
+            raise MeshbookError("bad_argument", "provider and provider_user_id are both required.")
+        if "/" in prov or "/" in uid:
+            # The server decodes %2F before routing, so the call could never
+            # reach the route; refuse it here rather than send a 404.
+            raise MeshbookError(
+                "bad_argument", "provider and provider_user_id cannot contain '/'."
+            )
+        headers = self._proof_headers(f"unlink:{prov.lower()}:{uid}")
+        data = _data(self._c._call(
+            "agent.unlink_oauth",
+            path={"provider": prov, "provider_user_id": uid},
+            headers=headers,
+        ))
+        self._c._me_cache = None  # the linked accounts in /api/me changed
+        return data if isinstance(data, dict) else {}
+
     def revoke(self, purge_local: bool = False, *, persist: bool = False) -> dict[str, Any]:
         """DELETE /api/me/agent-credentials — delete the per-agent source.
 
@@ -697,13 +805,20 @@ class _Agent(Namespace):
         anything existed. Already-minted access tokens stay valid until they
         expire (~5 min); that short lifetime IS the security parameter.
 
+        On the agent lane this sends an ``X-Agent-Key-Proof`` (action
+        ``"revoke"``), signed with the local key: the server requires it
+        since the C-01 hotfix, so a stolen 5-minute token cannot revoke. The
+        server also refuses to revoke a seat's LAST sign-in method (a key and
+        no linked provider: ``last_sign_in_method``, 400); enrol a
+        replacement key instead, or link a provider first.
+
         ``purge_local=True`` also unlinks the private key and the bundle.
         ``persist=True`` clears ``auth_mode`` from the config (with no
         mintable key the lane is dead — what both earlier clients did) and
         switches this client back to the bearer lane; check ``client.token``
         afterwards — None means the bench has no working auth at all.
         """
-        data = _data(self._c._call("agent.revoke"))
+        data = _data(self._c._call("agent.revoke", headers=self._proof_headers("revoke")))
         self._forget_token()
         if purge_local:
             for path in (self.key_path, self.meta_path):

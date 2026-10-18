@@ -78,6 +78,11 @@ ENDPOINTS: dict[str, Endpoint] = {
     "agent.enroll": _ep("POST", "/api/me/agent-credentials", mesh="none"),
     "agent.status": _ep("GET", "/api/me/agent-credentials", mesh="none"),
     "agent.revoke": _ep("DELETE", "/api/me/agent-credentials", mesh="none"),
+    # Unlinking an OAuth sign-in is account-level, not agent-only; it lives
+    # on client.agent because the agent-JWT lane must sign a key proof (C-01).
+    "agent.unlink_oauth": _ep(
+        "DELETE", "/api/me/oauth-accounts/{provider}/{provider_user_id}", mesh="none"
+    ),
     # ── meshes + membership ──
     "meshes.list": _ep("GET", "/api/meshes", mesh="none"),
     "meshes.activate": _ep("POST", "/api/meshes/active", mesh="none"),
