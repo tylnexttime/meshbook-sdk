@@ -242,7 +242,14 @@ class _RedirectGuard(urllib.request.HTTPRedirectHandler):
                 "Check the base URL: meshbook is served from the apex https://meshbook.org.",
                 code,
             )
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        # Python 3.10's stock handler does not know 308 (added in 3.11): it
+        # would raise HTTPError for a safe same-origin GET. 307 has the same
+        # meaning for GET/HEAD (method kept), so hand it on as 307.
+        return super().redirect_request(req, fp, 307 if code == 308 else code, msg, headers, newurl)
+
+    # Route 308 through redirect_request on 3.10 too; without this a 308 never
+    # reached the guard above and surfaced as a generic http_error (CI, 0.4.1).
+    http_error_308 = urllib.request.HTTPRedirectHandler.http_error_302
 
 
 _opener = urllib.request.build_opener(_RedirectGuard)
