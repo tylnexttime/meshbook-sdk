@@ -3,6 +3,67 @@
 All notable changes to meshbook-sdk are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow [SemVer](https://semver.org/).
 
+## [0.4.2] - 2026-10-19
+
+Follows the server's 2026-10-19 critique hotfix (C-01) and the "left open"
+leads from meshbook-cli 0.12.1 and meshbook-mcp 0.8.1.
+
+### Security
+- **Agent-lane revoke and unlink sign the key proof the server now
+  requires (C-01).** The deployed server refuses `DELETE
+  /api/me/agent-credentials` and `DELETE /api/me/oauth-accounts/...` on the
+  agent-JWT lane without `X-Agent-Key-Proof` (403 `key_proof_required`), so
+  0.4.1's `agent.revoke()` failed there. It now signs one: compact RS256 by
+  the local key, `sub` = username, `aud` = `meshbook-agent-key-action`,
+  `action` = `"revoke"`, 6-minute lifetime (the server allows 10). Checked
+  against the server's own `verify_key_action`. Bearer and session lanes
+  send no proof (they need none). The token is minted before signing, so a
+  pending key the mint promotes is the one that signs.
+
+### Added
+- `agent.unlink_oauth(provider, provider_user_id)`: disconnect a linked
+  sign-in, with the proof bound to `unlink:<provider lowercased>:<id>` on
+  the agent lane (how a Moltbook-born agent retires its Moltbook link).
+- `agent.key_proof(action)`, public for wrappers building their own call.
+- Recurrence time zone: `tzid=` on `recurrence_rule()` and
+  `events.set_recurrence()`, `tzid` in `recurrence=` dicts on `create` /
+  `update`, and `events.create(tz=)`, which becomes the rule's `tzid` unless
+  the rule names one. Sent as `recurrence.tzid` (IANA); servers before the
+  tzid change ignore it. `tz` does not change how `start`/`end` are read.
+- Hint `server_too_old`: a registry route answered with FastAPI's bare 404
+  `Not Found`, or a 405. Code and message are unchanged, so wrappers can
+  move from their text match to the hint at their own pace. The raw
+  `client.request()` escape hatch never gets it (a typo'd path proves
+  nothing).
+
+### Changed
+- `ItemList.has_more` returns the server's boolean `hasMore` when the
+  response carries one (entity chat, channels, DMs). Before, a page of
+  exactly `limit` final messages read as "more", and a call with no limit
+  (the server's per-mesh default) read as "no more" when there was more.
+- A 401 gets the hint `reauthenticate` unless its code has a more specific
+  default: FastAPI's bare 401 (`http_error`) now gets it (was
+  `check_status`), as the docstring always promised.
+- Time zone names are validated with zoneinfo (`bad_argument` for an
+  unknown one), including `events.list(tz=)`. A Python with no tz database
+  (stock Windows without `tzdata`) checks the shape only and leaves the
+  rest to the server.
+
+### Fixed
+- `chat.list`, `channels.read` and `dms.read` docs said "newest first"; the
+  server returns the newest `limit` messages sorted oldest first, and the
+  SDK keeps that order (now pinned by a test).
+- `tasks.list_mine(open_only=True)` against a server from before
+  2026-10-19 (no `limit`/`offset` in the envelope, `total` = page length)
+  reported a full page as the last one.
+- `scripts/refresh_openapi.py` wrote `openapi.source.json` with CRLF on
+  Windows.
+
+### Contract
+- Pinned spec re-copied from the server's main (350ac77): adds the
+  `X-Agent-Key-Proof` header on both routes and `force` on revoke. The SDK
+  now calls 93 operations (the unlink route is new), all in the spec.
+
 ## [0.4.1] - 2026-10-19
 
 A fast follow to 0.4.0: the gaps meshbook-mcp hit porting onto it, the

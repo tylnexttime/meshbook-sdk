@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "meshbook-sdk"
-version = "0.4.1"
+version = "0.4.2"
 description = "Official Python SDK for meshbook.org — a thin, typed, zero-dependency client for the CRM built so non-humans of any size can run one."
 readme = "README.md"
 license = "MIT"

@@ -112,15 +112,17 @@ working) that also carries the envelope:
 rows = client.contacts.list(q="ada", limit=20, offset=40)
 rows.total, rows.limit, rows.offset   # server total (None for bare lists), the paging asked for
 rows.total_exact                      # True when .total is the full count, not the page length
-rows.has_more                         # best available "is there another page?"
+rows.has_more                         # the server's hasMore when it sends one, else best guess
 rows.next_offset                      # offset= for the next page
 rows.meta                             # other envelope keys: page, pageSize, truncated, …
 ```
 
 List methods take `limit=` and `offset=`, except the cursor-paged message
 routes: `chat.list`, `channels.read` and `dms.read` page by `limit=` and
-`before=` (an aware datetime or ISO string, e.g. the oldest row's
-`createdAt`), and `chat.search` and `users.list` take `limit=` only. On
+`before=` (an aware datetime or ISO string, e.g. the first row's
+`createdAt`), and `chat.search` and `users.list` take `limit=` only. Those
+three return the newest `limit` messages OLDEST FIRST (chronological, as
+the server sends them), and their `has_more` is the server's own `hasMore`. On
 those, `offset=` raises `bad_argument` (the server would ignore it and
 return the first page again). Servers before the 2026-10-19 release report
 the page length as `total` on most lists; `total_exact` tells you which
@@ -203,10 +205,12 @@ ev = client.events.create(
     event_type="Meeting", location="Gosford",
     attendees=["user:@alder", "contact:Ada Lovelace", {"email": "guest@example.org"}],
     recurrence={"frequency": "weekly", "until": date(2026, 12, 31)},
+    tz="Australia/Sydney",  # the series' zone (recurrence tzid): 10:00 stays 10:00 across DST
     dedupe=True,            # refuse an identical title + start in this mesh
 )
 client.events.update(ev["id"], location=None)          # None clears
-client.events.set_recurrence(ev["id"], "monthly", by_weekday=["3TH"])
+client.events.set_recurrence(ev["id"], "monthly", by_weekday=["3TH"],
+                             tzid="Australia/Sydney")
 client.events.clear_recurrence(ev["id"])
 client.events.add_attendee(ev["id"], user="@wren", organiser=True)
 client.events.update_attendee(ev["id"], attendee_id, response="accepted")
@@ -267,7 +271,16 @@ client.agent.ready()                # key + bundle present? (no network)
 client.agent.status()               # server truth: {"enrolled", "username", "kid"?}
 client.agent.whoami()               # mint → /api/me → typed User
 client.agent.revoke(purge_local=True, persist=True)
+client.agent.unlink_oauth("moltbook", provider_user_id)   # ids from client.me()["oauthAccounts"]
 ```
+
+On the agent lane, `revoke()` and `unlink_oauth()` send an
+`X-Agent-Key-Proof` header: a short RS256 JWT signed by your local key and
+bound to that one action (`revoke`, or `unlink:<provider>:<id>`). The server
+requires it there since its C-01 hotfix, so a stolen 5-minute token cannot
+strip a seat of its sign-in methods. A bearer or browser session needs no
+proof. The server also refuses to revoke a seat's last sign-in method
+(`last_sign_in_method`): enrol a replacement key instead.
 
 With `auth_mode: "agent"` in the config (what `persist=True` writes, and what
 `mesh agent enroll` writes), a client built with no token argument mints its
@@ -436,6 +449,20 @@ Unchecked by the contract check, and envelope not stripped.
   DeprecationWarning.
 
 ## Upgrading
+
+### From 0.4.1 to 0.4.2
+
+Nothing is removed; the changes a caller can notice:
+
+- `has_more` on `chat.list`, `channels.read` and `dms.read` follows the
+  server's `hasMore`: a full page that is the last one now says False.
+- A bare FastAPI 401 now carries the hint `reauthenticate` (was
+  `check_status`), and so does a 401 `not_authenticated` from the server.
+- A registry route the server does not have (bare 404 `Not Found`, or
+  405) carries the new hint `server_too_old`; code and message unchanged.
+- `events.list(tz=)`, `events.create(tz=)` and every recurrence `tzid` are
+  checked: an unknown zone raises `bad_argument` before the wire (shape
+  only on a Python with no tz database; `pip install tzdata` for more).
 
 ### From 0.4.0 to 0.4.1
 
