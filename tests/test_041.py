@@ -190,3 +190,44 @@ def test_error_body_cut_off_still_raises_the_status(client, monkeypatch):
     with pytest.raises(MeshbookError) as ei:
         client.contacts.list()
     assert ei.value.status == 404
+
+
+# ─── critique C-10: an empty mesh is an error, never a fallthrough ─────
+
+
+def _cfg_with_mesh(tmp_path):
+    import json
+
+    p = tmp_path / "cfg"
+    p.write_text(json.dumps({"token": "t", "active_mesh_id": MESH}), encoding="utf-8")
+    return p
+
+
+@pytest.mark.parametrize("kwargs", [{"mesh": ""}, {"mesh": "  "}, {"active_mesh_id": ""}])
+def test_empty_client_mesh_is_refused_not_the_persisted_one(tmp_path, kwargs):
+    with pytest.raises(MeshbookError) as ei:
+        MeshbookClient(config_path=_cfg_with_mesh(tmp_path), **kwargs)
+    assert ei.value.code == "bad_argument"
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_set_but_empty_env_mesh_is_refused(tmp_path, monkeypatch, value):
+    monkeypatch.setenv("MESHBOOK_MESH", value)
+    with pytest.raises(MeshbookError) as ei:
+        MeshbookClient(config_path=_cfg_with_mesh(tmp_path))
+    assert ei.value.code == "bad_argument" and "MESHBOOK_MESH" in ei.value.message
+
+
+def test_unset_env_mesh_still_uses_the_config(tmp_path):
+    assert MeshbookClient(config_path=_cfg_with_mesh(tmp_path)).active_mesh_id == MESH
+
+
+def test_empty_per_call_mesh_is_bad_argument(client, monkeypatch):
+    r = install(monkeypatch)
+    with pytest.raises(MeshbookError) as ei:
+        client.tasks.list(mesh="")
+    assert ei.value.code == "bad_argument"
+    with pytest.raises(MeshbookError) as ei:
+        client.meshes.leave(mesh="")
+    assert ei.value.code == "bad_argument"
+    assert r.requests == []

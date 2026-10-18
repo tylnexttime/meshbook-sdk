@@ -652,10 +652,26 @@ class MeshbookClient:
             raise MeshbookError(
                 "bad_argument", "Pass mesh= or active_mesh_id=, not both with different values."
             )
+        # A SET-but-empty mesh (mesh="", MESHBOOK_MESH="" from an unset
+        # shell variable) is a caller bug, not "no preference": falling
+        # through to the config's persisted mesh would write somewhere the
+        # caller never named (critique C-10). Refuse it.
+        for label, given in (("mesh", mesh), ("active_mesh_id", active_mesh_id)):
+            if given is not None and not str(given).strip():
+                raise MeshbookError(
+                    "bad_argument",
+                    f"{label}= is empty. Give a mesh id or name, or leave it out (None).",
+                )
+        raw_env_mesh = os.environ.get("MESHBOOK_MESH")
+        if raw_env_mesh is not None and not raw_env_mesh.strip():
+            raise MeshbookError(
+                "bad_argument",
+                "MESHBOOK_MESH is set but empty. Unset it, or set it to a mesh id or name.",
+            )
         self._active_mesh_id: str | None = None
         self._pending_mesh_ref: str | None = None
         self.mesh_source: str | None = None
-        env_mesh = (os.environ.get("MESHBOOK_MESH") or "").strip() or None
+        env_mesh = (raw_env_mesh or "").strip() or None
         cfg_mesh = cfg.get("active_mesh_id") if isinstance(cfg.get("active_mesh_id"), str) else None
         if active_mesh_id:
             self._active_mesh_id, self.mesh_source = str(active_mesh_id), "argument"
@@ -760,7 +776,9 @@ class MeshbookClient:
     def _mesh_lookup(self, ref: str, *, require_membership: bool) -> Mesh:
         target = (ref or "").strip()
         if not target:
-            raise MeshbookError("mesh_not_found", "Empty mesh name/id.")
+            raise MeshbookError(
+                "bad_argument", "mesh= is empty. Give a mesh id or name, or leave it out (None)."
+            )
         if _is_uuid(target) and not require_membership:
             return Mesh(id=target, name="", mesh_type="", member_role="", raw={"id": target})
         mine = self._my_meshes()
