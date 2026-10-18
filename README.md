@@ -93,9 +93,9 @@ rows.has_more                         # best available "is there another page?"
 rows.meta                             # other envelope keys: page, pageSize, truncated, …
 ```
 
-Every list method takes `limit=` and `offset=`. Many endpoints report the
-page length as `total`, so `has_more` (which also fires on a full page) is
-the honest signal. If a server ignores `limit`, the page is cut client-side
+Every list method takes `limit=` and `offset=`. Servers before the
+2026-10-19 release report the page length as `total` on most lists, so
+`has_more` (which also fires on a full page) is the honest signal there. If a server ignores `limit`, the page is cut client-side
 so `limit=` means the same thing everywhere.
 
 Four stable shapes are frozen dataclasses with the full payload in `.raw`:
