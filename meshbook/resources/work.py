@@ -369,13 +369,16 @@ class Tasks(Namespace):
         mesh: str | None = None,
     ) -> dict[str, Any]:
         """POST /api/task-time-logs. ``hours`` in (0, 24]; ``date`` is a
-        ``date`` or ``'YYYY-MM-DD'`` (default: today in UTC, as the CLI did)."""
+        ``date`` or ``'YYYY-MM-DD'`` (default: TODAY IN THE LOCAL TIME ZONE
+        of the machine running the code; 0.4.0 used the UTC date, which
+        filed an 08:00 Sydney entry under yesterday). Pass ``date=`` when
+        the machine's zone is not the one the work was done in."""
         if not isinstance(hours, (int, float)) or isinstance(hours, bool) or not 0 < hours <= 24:
             raise MeshbookError("bad_argument", f"hours must be > 0 and <= 24, got {hours!r}.")
         logged = (
             iso_date(date, "date")
             if date is not None
-            else _dt.datetime.now(_dt.timezone.utc).date().isoformat()
+            else _dt.date.today().isoformat()
         )
         body: dict[str, Any] = {"taskId": task_id, "hours": hours, "loggedForDate": logged}
         put_if(body, "note", note)

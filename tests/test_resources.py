@@ -165,7 +165,7 @@ def test_tasks_delete_and_log_time(client, monkeypatch):
     client.tasks.log_time(T1, 1.5, dt.date(2026, 10, 18), note="review")
     assert r.body() == {"taskId": T1, "hours": 1.5, "loggedForDate": "2026-10-18", "note": "review"}
     client.tasks.log_time(T1, 2)
-    assert r.body()["loggedForDate"] == dt.datetime.now(dt.timezone.utc).date().isoformat()
+    assert r.body()["loggedForDate"] == dt.date.today().isoformat()  # local, not UTC (C-23)
     for bad in (0, 25, -1):
         with pytest.raises(MeshbookError):
             client.tasks.log_time(T1, bad)

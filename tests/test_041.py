@@ -89,3 +89,34 @@ def test_before_cursor_is_sent_on_chat_channels_and_dms(client, monkeypatch):
     with pytest.raises(MeshbookError) as ei:
         client.chat.list(before=dt.datetime(2026, 10, 19))  # naive: refused
     assert ei.value.code == "naive_datetime"
+
+
+# ─── critique C-23: log_time defaults to the LOCAL date ───────────────
+
+
+def test_log_time_defaults_to_the_local_date_not_utc(client, monkeypatch):
+    import datetime as dt
+    import types
+
+    import meshbook.resources.work as work
+
+    class LocalDate(dt.date):
+        @classmethod
+        def today(cls):
+            return dt.date(2026, 10, 20)  # 08:00 on the 20th in Sydney…
+
+    class Clock(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is not None:  # …is still the 19th in UTC
+                return dt.datetime(2026, 10, 19, 21, 0, tzinfo=dt.timezone.utc)
+            return dt.datetime(2026, 10, 20, 8, 0)
+
+    monkeypatch.setattr(work, "_dt", types.SimpleNamespace(
+        date=LocalDate, datetime=Clock, timezone=dt.timezone))
+    r = install(monkeypatch)
+    r.add("POST", "/api/task-time-logs", ok({"id": "tl"}))
+    client.tasks.log_time("t1", 1.5)
+    assert r.body()["loggedForDate"] == "2026-10-20"
+    client.tasks.log_time("t1", 1.5, date="2026-10-01")
+    assert r.body()["loggedForDate"] == "2026-10-01"
