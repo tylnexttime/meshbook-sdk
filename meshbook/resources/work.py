@@ -272,7 +272,12 @@ class Tasks(Namespace):
                 limit=rows.limit,
                 offset=rows.offset,
                 meta=dict(
-                    rows.meta, open_only=True, server_rows=len(rows), server_total=rows.total
+                    rows.meta,
+                    open_only=True,
+                    server_rows=len(rows),
+                    server_total=rows.total,
+                    # An older server's total is the page length, not a count.
+                    server_total_exact=rows.total_exact,
                 ),
                 total_exact=False,
             )

@@ -427,3 +427,29 @@ def test_chat_docstrings_say_oldest_first():
         doc = fn.__doc__ or ""
         assert "newest first" not in doc, fn.__qualname__
         assert "oldest first" in doc, fn.__qualname__
+
+
+# ─── 7. squashed on the way: list_mine(open_only) on an older server ───
+
+from tests._fakes import U1, ok_list  # noqa: E402
+
+
+def test_open_only_full_page_from_an_older_server_still_says_more(ev_client, monkeypatch):
+    """MCP 0.8.1 lead 2. A server before 2026-10-19 sends no limit/offset,
+    and its `total` is the page length. has_more read that as the exact
+    count, so a full page (4 of 4 sent) looked like the last one."""
+    r = install(monkeypatch)
+    r.add("GET", "/api/me", ok({"user": {"id": U1}}))
+    page = [{"id": i, "status": "Done" if i % 2 else "NotStarted"} for i in range(4)]
+    r.add("GET", "/api/tasks", ok_list(page))  # total=4, no limit/offset: the old shape
+    mine = ev_client.tasks.list_mine(open_only=True, limit=4)
+    assert [t["id"] for t in mine] == [0, 2]
+    assert mine.has_more is True, "a full server page is the only signal an old server gives"
+    assert mine.next_offset == 4
+
+
+def test_open_only_short_page_from_an_older_server_is_the_last(ev_client, monkeypatch):
+    r = install(monkeypatch)
+    r.add("GET", "/api/me", ok({"user": {"id": U1}}))
+    r.add("GET", "/api/tasks", ok_list([{"id": 1, "status": "Done"}]))
+    assert ev_client.tasks.list_mine(open_only=True, limit=4).has_more is False

@@ -100,7 +100,13 @@ class ItemList(list[T], Generic[T]):
         if self.total is not None and self.total > start + consumed:
             return True
         if self.meta.get("server_total") is not None:
-            return int(self.meta["server_total"]) > start + consumed
+            if int(self.meta["server_total"]) > start + consumed:
+                return True
+            # Trust "nothing beyond" only from an exact count; an older
+            # server's total is the page length, so fall through to the
+            # full-page check (MCP 0.8.1 lead 2).
+            if self.meta.get("server_total_exact", True):
+                return False
         return self.truncated or (self.limit is not None and consumed >= self.limit)
 
     @property
