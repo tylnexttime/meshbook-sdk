@@ -158,7 +158,14 @@ HINT_MEANINGS: dict[str, str] = {
     "choose_out_path": "choose another output directory or file name",
     "use_before_cursor": "page with limit and before (no offset on this route)",
     "choose_permitted_mesh": "use a mesh this token is scoped to",
+    "server_too_old": "the server does not have this route yet: it is older than this SDK",
 }
+
+# A 401 means the server rejected the credential that was sent. These
+# default hints say less than that, so on a 401 ``reauthenticate`` replaces
+# them; any other default (e.g. ``check_agent_key`` for ``mint_failed``) is
+# more specific and stays.
+_GENERIC_ON_401 = frozenset({"check_status", "provide_credentials"})
 
 
 class MeshbookError(Exception):
@@ -173,8 +180,10 @@ class MeshbookError(Exception):
                  model; its wording is NOT stable, so do not parse it.
         hint:    stable machine hint for what to do next (see
                  :data:`HINT_MEANINGS`), or None when there is no generic
-                 advice. Defaults from :data:`HINTS` by code; a 401 with
-                 no mapped code gets ``reauthenticate``.
+                 advice. Defaults from :data:`HINTS` by code; a 401 gets
+                 ``reauthenticate`` unless its code has a more specific
+                 default than ``check_status`` / ``provide_credentials``
+                 (so FastAPI's bare 401, ``http_error``, gets it too).
     """
 
     def __init__(self, code: str, message: str, status: int = 0, *, hint: str | None = None):
@@ -183,7 +192,7 @@ class MeshbookError(Exception):
         self.status = status
         if hint is None:
             hint = HINTS.get(code)
-            if hint is None and status == 401:
+            if status == 401 and (hint is None or hint in _GENERIC_ON_401):
                 hint = "reauthenticate"
             elif hint is None and code == "token_out_of_scope":
                 hint = "choose_permitted_mesh"

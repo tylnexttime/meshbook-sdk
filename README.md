@@ -353,8 +353,12 @@ table against the codes the package actually raises.
 | `validation_error` | the server's request validation failed (FastAPI 422) | `fix_argument` |
 | `write_failed` | the downloaded file cannot be written | `check_permissions` |
 
-A 401 without a mapped code gets the hint `reauthenticate`;
-`token_out_of_scope` gets `choose_permitted_mesh`.
+A 401 gets the hint `reauthenticate` unless its code has a more specific
+default (FastAPI's bare 401 arrives as `http_error` and gets it too);
+`token_out_of_scope` gets `choose_permitted_mesh`. A registry route the
+server answers with FastAPI's bare 404 `Not Found`, or with a 405, gets
+`server_too_old`: the server predates that route (the code stays
+`http_error`, the message `Not Found`).
 
 | Hint | Means |
 |---|---|
@@ -384,6 +388,7 @@ A 401 without a mapped code gets the hint `reauthenticate`;
 | `reply_in_entity_chat` | reply through entity chat, not a channel |
 | `resolve_pending_key` | recover or discard the pending agent key |
 | `retry_later` | retry after a short wait |
+| `server_too_old` | the server does not have this route yet: it is older than this SDK |
 | `use_before_cursor` | page with limit and before (no offset on this route) |
 | `use_id` | refer to it by id instead of name |
 | `use_username` | refer to the member by @username |

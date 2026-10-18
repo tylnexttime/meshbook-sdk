@@ -521,7 +521,18 @@ def _network_hint(method: str, maybe_sent: bool) -> str:
     return "check_before_retry" if maybe_sent and method not in ("GET", "HEAD") else "retry_later"
 
 
-def _raise_from_http_error(e: urllib.error.HTTPError) -> None:
+def _raise_from_http_error(e: urllib.error.HTTPError, known_route: bool = False) -> None:
+    """Raise the MeshbookError for an HTTP error response.
+
+    *known_route*: the request came from the endpoint registry, so the SDK
+    knows the route exists in the contract. Then FastAPI's own answer for a
+    route it does not have (a 404 whose body is the bare ``{"detail": "Not
+    Found"}``, or any 405) means the server predates the route: hint
+    ``server_too_old``. Code and message stay as they were (``http_error``,
+    ``Not Found``), so older wrappers that text-match keep working. Our own
+    routes say ``not_found`` in the envelope, and a route's own string
+    detail is never exactly "Not Found" (checked against the server tree).
+    """
     try:
         raw = e.read().decode("utf-8", "replace") if e.fp else "{}"
     except (OSError, http.client.HTTPException):
@@ -533,7 +544,12 @@ def _raise_from_http_error(e: urllib.error.HTTPError) -> None:
     except json.JSONDecodeError:
         raise MeshbookError("http_error", raw[:200], status=e.code) from e
     code, message = _err_fields(payload, raw)
-    raise MeshbookError(code, message, status=e.code) from e
+    hint = None
+    if known_route and (
+        e.code == 405 or (e.code == 404 and code == "http_error" and message == "Not Found")
+    ):
+        hint = "server_too_old"
+    raise MeshbookError(code, message, status=e.code, hint=hint) from e
 
 
 def _retry_after(headers: Any) -> float | None:
@@ -942,6 +958,7 @@ class MeshbookClient:
         mesh_id: str | None = None,
         raw: bool = False,
         extra_headers: Mapping[str, str] | None = None,
+        known_route: bool = False,
     ) -> Any:
         """One logical request: auth, headers, 429/503 retries, one agent re-mint.
 
@@ -999,7 +1016,7 @@ class MeshbookClient:
                     _close_quietly(e)
                     _sleep(delay if delay is not None else _backoff(attempt))
                     continue
-                _raise_from_http_error(e)
+                _raise_from_http_error(e, known_route)
                 raise  # unreachable; keeps type checkers honest
             except urllib.error.URLError as e:
                 maybe_sent = isinstance(e.reason, (TimeoutError, ConnectionResetError))
@@ -1072,6 +1089,7 @@ class MeshbookClient:
             token=token,
             mesh_id=self._endpoint_mesh(ep, path, mesh),
             extra_headers=headers,
+            known_route=True,
         )
 
     def _list(
@@ -1105,6 +1123,7 @@ class MeshbookClient:
             require_auth=ep.auth,
             mesh_id=self._endpoint_mesh(ep, path, mesh),
             raw=True,
+            known_route=True,
         )
         return DownloadedFile(
             safe_filename(_filename_from_disposition(_disposition(headers))), bytes(content)

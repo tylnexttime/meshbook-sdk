@@ -453,3 +453,92 @@ def test_open_only_short_page_from_an_older_server_is_the_last(ev_client, monkey
     r.add("GET", "/api/me", ok({"user": {"id": U1}}))
     r.add("GET", "/api/tasks", ok_list([{"id": 1, "status": "Done"}]))
     assert ev_client.tasks.list_mine(open_only=True, limit=4).has_more is False
+
+
+# ─── 5. a bare FastAPI 401 carries reauthenticate ──────────────────────
+
+
+def test_a_bare_fastapi_401_says_reauthenticate(ev_client, monkeypatch):
+    """require_user raises bare: {"detail": "Not authenticated"} with no code,
+    so it became http_error, whose default hint check_status won."""
+    r = install(monkeypatch)
+    r.add("GET", "/api/contacts", Err(401, {"detail": "Not authenticated"}))
+    with pytest.raises(MeshbookError) as ei:
+        ev_client.contacts.list()
+    assert (ei.value.status, ei.value.code) == (401, "http_error")
+    assert ei.value.hint == "reauthenticate"
+
+
+def test_401_hint_rules():
+    E = MeshbookError
+    assert E("http_error", "Not authenticated", 401).hint == "reauthenticate"
+    assert E("api_error", "x", 401).hint == "reauthenticate"
+    # the server's own code for a rejected credential: the caller DID send one
+    assert E("not_authenticated", "x", 401).hint == "reauthenticate"
+    # local not_authenticated (nothing sent yet) keeps provide_credentials
+    assert E("not_authenticated", "x").hint == "provide_credentials"
+    # a more specific default still wins on a 401
+    assert E("mint_failed", "x", 401).hint == "check_agent_key"
+    # an explicit hint always wins
+    assert E("http_error", "x", 401, hint="resolve_pending_key").hint == "resolve_pending_key"
+    # other statuses are untouched
+    assert E("http_error", "x", 500).hint == "check_status"
+
+
+# ─── 6. server_too_old: the route is not on this server ────────────────
+
+
+def test_bare_404_on_a_registry_route_is_server_too_old(ev_client, monkeypatch):
+    r = install(monkeypatch)
+    r.add("PATCH", EV, Err(404, {"detail": "Not Found"}))
+    with pytest.raises(MeshbookError) as ei:
+        ev_client.events.update(E1, title="x")
+    assert ei.value.hint == "server_too_old"
+    # code and message unchanged: meshbook-cli 0.12.1 still text-matches them
+    assert (ei.value.status, ei.value.code, ei.value.message) == (404, "http_error", "Not Found")
+
+
+def test_405_on_a_registry_route_is_server_too_old(ev_client, monkeypatch):
+    r = install(monkeypatch)
+    r.add("PUT", EV + "/recurrence", Err(405, {"detail": "Method Not Allowed"}))
+    with pytest.raises(MeshbookError) as ei:
+        ev_client.events.set_recurrence(E1, "weekly")
+    assert ei.value.hint == "server_too_old"
+
+
+def test_a_routes_own_404_is_not_server_too_old(ev_client, monkeypatch):
+    r = install(monkeypatch)
+    r.add("GET", EV, Err(404, {"ok": False, "error": {"code": "not_found",
+                                                       "message": "No such event"}}))
+    r.add("GET", "/api/contacts/x1", Err(404, {"detail": "Contact not found"}))
+    with pytest.raises(MeshbookError) as ei:
+        ev_client.events.get(E1)
+    assert ei.value.hint != "server_too_old" and ei.value.code == "not_found"
+    with pytest.raises(MeshbookError) as ei:
+        ev_client.contacts.get("x1")
+    assert ei.value.hint == "check_status"
+
+
+def test_a_downloads_bare_404_is_server_too_old_too(ev_client, monkeypatch):
+    r = install(monkeypatch)
+    r.add("GET", "/api/entity-attachments/a1/download", Err(404, {"detail": "Not Found"}))
+    with pytest.raises(MeshbookError) as ei:
+        ev_client.files.download_bytes("a1")
+    assert ei.value.hint == "server_too_old"
+
+
+@pytest.mark.raw_request
+def test_the_raw_escape_hatch_does_not_claim_server_too_old(ev_client, monkeypatch):
+    """client.request() can name any path, typos included: a bare 404 there
+    is not evidence the server is old."""
+    r = install(monkeypatch)
+    r.add("GET", "/api/no-such-thing", Err(404, {"detail": "Not Found"}))
+    with pytest.raises(MeshbookError) as ei:
+        ev_client.request("GET", "/api/no-such-thing")
+    assert ei.value.hint == "check_status"
+
+
+def test_server_too_old_is_documented():
+    from meshbook.errors import HINT_MEANINGS
+
+    assert "server_too_old" in HINT_MEANINGS
