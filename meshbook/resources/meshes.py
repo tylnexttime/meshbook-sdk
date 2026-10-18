@@ -7,7 +7,7 @@ from .. import config as _config
 from ..client import _is_uuid
 from ..errors import MeshbookError
 from ..models import ItemList, Mesh
-from ._base import Namespace, as_dict
+from ._base import Namespace, as_dict, no_offset
 
 
 class Meshes(Namespace):
@@ -183,9 +183,11 @@ class Users(Namespace):
         mesh: str | None = None,
     ) -> ItemList[dict[str, Any]]:
         """GET /api/users — members of the mesh (``q`` is a substring filter
-        over display name / username; ``lite`` trims each row)."""
+        over display name / username; ``lite`` trims each row). The route
+        takes ``limit`` only: ``offset=`` raises ``bad_argument``."""
+        no_offset(offset, "users.list()", cursor="limit=")
         params: dict[str, Any] = {"q": q, "lite": True if lite else None}
-        return self._c._list("users.list", params=params, limit=limit, offset=offset, mesh=mesh)
+        return self._c._list("users.list", params=params, limit=limit, mesh=mesh)
 
     def resolve(self, user: str, *, mesh: str | None = None) -> dict[str, Any]:
         """A user ref → a user row.

@@ -50,8 +50,10 @@ def test_bare_list_endpoints_are_itemlists_with_total_none(client, monkeypatch):
 
 def test_server_ignoring_limit_is_paged_client_side(client, monkeypatch):
     r = install(monkeypatch)
-    r.add("GET", "/api/users", ok_list([{"id": i} for i in range(10)]))
-    rows = client.users.list(limit=3, offset=4)
+    # /api/tags declares no limit/offset (0.4.0 used /api/users here, which
+    # DOES take limit, so it ignored only the offset: see test_041).
+    r.add("GET", "/api/tags", ok_list([{"id": i} for i in range(10)]))
+    rows = client.tags.list(limit=3, offset=4)
     assert [u["id"] for u in rows] == [4, 5, 6]
     assert rows.total == 10 and rows.meta["client_paginated"] is True
 

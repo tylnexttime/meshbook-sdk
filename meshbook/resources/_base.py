@@ -58,6 +58,19 @@ def as_dict(payload: Any) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def no_offset(offset: Any, what: str, cursor: str = "limit= and before=") -> None:
+    """Refuse ``offset=`` on a route whose server ignores it.
+
+    These routes page by *cursor* only; an offset sent there is dropped
+    server-side and the caller would silently get the first page again.
+    """
+    if offset is not None:
+        raise MeshbookError(
+            "bad_argument",
+            f"{what} does not support offset=: the server ignores it and pages by {cursor} only.",
+        )
+
+
 class Namespace:
     def __init__(self, client: MeshbookClient) -> None:
         self._c = client
@@ -76,4 +89,4 @@ class Namespace:
         return str(value).strip()
 
 
-__all__ = ["UNSET", "Namespace", "as_dict", "merge_fields", "put", "put_if"]
+__all__ = ["UNSET", "Namespace", "as_dict", "merge_fields", "no_offset", "put", "put_if"]

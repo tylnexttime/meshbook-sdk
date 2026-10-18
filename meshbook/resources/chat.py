@@ -8,10 +8,11 @@ import uuid as _uuid
 from pathlib import Path
 from typing import Any
 
+from .._times import iso_datetime
 from ..client import _is_uuid
 from ..errors import MeshbookError
 from ..models import Attachment, DownloadedFile, ItemList, SearchResults
-from ._base import Namespace, as_dict, put_if
+from ._base import Namespace, as_dict, no_offset, put_if
 
 
 def _file_body(
@@ -29,6 +30,11 @@ def _file_body(
         "mimeType": mime or mimetypes.guess_type(str(path))[0] or "application/octet-stream",
         "base64Bytes": base64.b64encode(raw).decode("ascii"),
     }
+
+
+def _before(value: Any) -> str | None:
+    """The ``before`` paging cursor: an aware datetime or ISO string."""
+    return None if value is None else iso_datetime(value, "before")
 
 
 class Chat(Namespace):
@@ -67,16 +73,24 @@ class Chat(Namespace):
         limit: int | None = 20,
         *,
         offset: int | None = None,
+        before: Any = None,
         entity_type: str = "mesh",
         entity_id: str | None = None,
         mesh: str | None = None,
     ) -> ItemList[dict[str, Any]]:
-        """GET /api/entities/{type}/{id}/chat — newest first."""
+        """GET /api/entities/{type}/{id}/chat — newest first.
+
+        Pages by cursor: ``before`` (an aware datetime or ISO string, e.g.
+        the oldest row's ``createdAt``) loads messages older than it.
+        ``offset=`` raises ``bad_argument`` (the server ignores it; 0.4.0
+        sent it and silently returned the first page again).
+        """
+        no_offset(offset, "chat.list()")
         return self._c._list(
             "chat.list",
             path=self._thread(entity_type, entity_id, mesh),
+            params={"before": _before(before)},
             limit=limit,
-            offset=offset,
             mesh=mesh,
         )
 
@@ -100,12 +114,12 @@ class Chat(Namespace):
         and ``.semantic`` (False when the server's embedding arm was down
         and recall was keyword-only — still valid results, just narrower).
         The 0.3 dict keys (``res["items"]`` …) still work, with a
-        DeprecationWarning.
+        DeprecationWarning. ``offset=`` raises ``bad_argument``: the search
+        route takes ``limit`` only.
         """
+        no_offset(offset, "chat.search()", cursor="limit=")
         self._c._require_mesh(mesh)
-        out = self._c._list(
-            "chat.search", lead={"q": q}, limit=limit, offset=offset, mesh=mesh, cls=SearchResults
-        )
+        out = self._c._list("chat.search", lead={"q": q}, limit=limit, mesh=mesh, cls=SearchResults)
         assert isinstance(out, SearchResults)
         return out
 
@@ -264,12 +278,19 @@ class Channels(Namespace):
         limit: int | None = 20,
         *,
         offset: int | None = None,
+        before: Any = None,
         mesh: str | None = None,
     ) -> ItemList[dict[str, Any]]:
-        """GET /api/channels/{id}/messages — newest first."""
+        """GET /api/channels/{id}/messages — newest first. Pages by
+        ``before`` as :meth:`Chat.list`; ``offset=`` raises ``bad_argument``."""
+        no_offset(offset, "channels.read()")
         channel_id = self._channel_id(channel, mesh)
         return self._c._list(
-            "channels.messages", path={"channel_id": channel_id}, limit=limit, offset=offset, mesh=mesh
+            "channels.messages",
+            path={"channel_id": channel_id},
+            params={"before": _before(before)},
+            limit=limit,
+            mesh=mesh,
         )
 
     def post(
@@ -394,12 +415,19 @@ class Dms(Namespace):
         limit: int | None = 20,
         *,
         offset: int | None = None,
+        before: Any = None,
         mesh: str | None = None,
     ) -> ItemList[dict[str, Any]]:
-        """Messages in your DM thread with *user* — newest first."""
+        """Messages in your DM thread with *user* — newest first. Pages by
+        ``before`` as :meth:`Chat.list`; ``offset=`` raises ``bad_argument``."""
+        no_offset(offset, "dms.read()")
         dm = self.open(user, mesh=mesh)
         return self._c._list(
-            "channels.messages", path={"channel_id": dm["id"]}, limit=limit, offset=offset, mesh=mesh
+            "channels.messages",
+            path={"channel_id": dm["id"]},
+            params={"before": _before(before)},
+            limit=limit,
+            mesh=mesh,
         )
 
     def send(self, user: str, message: str, *, mesh: str | None = None) -> dict[str, Any]:
