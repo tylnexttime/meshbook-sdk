@@ -148,8 +148,9 @@ def test_save_is_atomic_when_replace_fails(tmp_path, monkeypatch):
         cfgmod.save_config({"token": "mb_token_new"}, p)
     assert ei.value.code == "config_write_failed"
     assert p.read_bytes() == before
-    leftovers = [f.name for f in tmp_path.iterdir() if f.name != "config"]
-    assert leftovers == [], f"temp/lock files left behind: {leftovers}"
+    leftovers = [f.name for f in tmp_path.iterdir()
+                 if f.name not in ("config", cfgmod.LOCK_FILENAME)]
+    assert leftovers == [], f"temp files left behind: {leftovers}"
 
 
 def test_concurrent_writers_lose_no_keys(tmp_path):
@@ -174,32 +175,68 @@ def test_concurrent_writers_lose_no_keys(tmp_path):
     on_disk = cfgmod.load_config(p)
     assert all(on_disk.get(f"k{i}") == i for i in range(20)), on_disk
     assert on_disk["token"] == "t"
-    assert not (tmp_path / cfgmod.LOCK_FILENAME).exists()
+    with cfgmod._locked(tmp_path, timeout=0.1):  # released afterwards
+        pass
 
 
-def test_a_live_lock_times_out_with_a_named_error(tmp_path):
+def test_a_held_lock_times_out_with_a_named_error(tmp_path):
     p = tmp_path / "config"
-    lock = tmp_path / cfgmod.LOCK_FILENAME
-    lock.write_text("12345\n", encoding="ascii")  # fresh: a live writer
     t0 = time.monotonic()
-    with pytest.raises(MeshbookError) as ei:
-        cfgmod.save_config({"token": "t"}, p, lock_timeout=0.2)
+    with cfgmod._locked(tmp_path, timeout=1):
+        with pytest.raises(MeshbookError) as ei:
+            cfgmod.save_config({"token": "t"}, p, lock_timeout=0.2)
     assert ei.value.code == "config_locked"
-    assert str(lock) in ei.value.message
     assert time.monotonic() - t0 >= 0.2
     assert not p.exists(), "nothing may be written without the lock"
-    assert lock.exists(), "someone else's lock must not be removed"
 
 
-def test_a_stale_lock_is_broken(tmp_path):
-    p = tmp_path / "config"
-    lock = tmp_path / cfgmod.LOCK_FILENAME
-    lock.write_text("999999\n", encoding="ascii")
-    old = time.time() - (cfgmod.LOCK_STALE_AFTER + 5)
-    os.utime(lock, (old, old))
-    cfgmod.save_config({"token": "t"}, p, lock_timeout=0.2)
-    assert cfgmod.load_config(p)["token"] == "t"
-    assert not lock.exists()
+def test_a_lock_file_left_behind_does_not_block(tmp_path):
+    """The lock is the OS lock, not the file's existence: a config.lock left
+    by a crashed process (or by meshbook-sdk's first draft) is no obstacle."""
+    (tmp_path / cfgmod.LOCK_FILENAME).write_text("999999\n", encoding="ascii")
+    cfgmod.save_config({"token": "t"}, tmp_path / "config", lock_timeout=0.2)
+    assert cfgmod.load_config(tmp_path / "config")["token"] == "t"
+
+
+def test_the_lock_is_released_when_the_body_raises(tmp_path):
+    with pytest.raises(RuntimeError):
+        with cfgmod._locked(tmp_path, timeout=0.2):
+            raise RuntimeError("boom")
+    with cfgmod._locked(tmp_path, timeout=0.2):
+        pass
+
+
+_HOLDER = """
+import sys, time
+import meshbook.config as c
+with c._locked(__import__("pathlib").Path(sys.argv[1]), timeout=5):
+    print("held", flush=True)
+    time.sleep(float(sys.argv[2]))
+"""
+
+
+def test_the_lock_excludes_another_process_and_dies_with_it(tmp_path):
+    """Cross-process, and the case the age-based draft got wrong: a holder
+    that dies (killed, not exiting cleanly) frees the lock at once."""
+    import subprocess
+    import sys
+
+    holder = subprocess.Popen([sys.executable, "-c", _HOLDER, str(tmp_path), "30"],
+                              stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "held"
+        with pytest.raises(MeshbookError) as ei:
+            cfgmod.save_config({"token": "t"}, tmp_path / "config", lock_timeout=0.3)
+        assert ei.value.code == "config_locked"
+        holder.kill()  # a crash, not a clean release
+        holder.wait(timeout=10)
+        cfgmod.save_config({"token": "t"}, tmp_path / "config", lock_timeout=2)
+        assert cfgmod.load_config(tmp_path / "config")["token"] == "t"
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=10)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="mode bits are POSIX-only")

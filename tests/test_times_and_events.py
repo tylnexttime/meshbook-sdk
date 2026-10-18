@@ -238,10 +238,34 @@ def test_recurrence_rule_shapes():
     for bad in (lambda: recurrence_rule("hourly"), lambda: recurrence_rule("daily", 0),
                 lambda: recurrence_rule("daily", until="2026-12-31", count=3),
                 lambda: recurrence_rule("weekly", by_weekday=["XX"]),
-                lambda: recurrence_rule("weekly", by_weekday=[])):
+                lambda: recurrence_rule("weekly", by_weekday=[]),
+                # CALENDAR-CONTRACT 3: ordinals and byMonthDay are Monthly-only,
+                # and byMonthDay never comes with byWeekday.
+                lambda: recurrence_rule("weekly", by_weekday=["3TH"]),
+                lambda: recurrence_rule("weekly", by_month_day=[1]),
+                lambda: recurrence_rule("monthly", by_month_day=[1], by_weekday=["MO"]),
+                lambda: recurrence_rule("monthly", by_month_day=[0]),
+                lambda: recurrence_rule("monthly", by_weekday=["9TH"])):
         with pytest.raises(MeshbookError) as ei:
             bad()
         assert ei.value.code == "bad_argument"
+
+
+def test_monthly_by_month_day_and_last_friday():
+    assert recurrence_rule("monthly", by_month_day=[1, -1])["byMonthDay"] == [1, -1]
+    assert recurrence_rule("monthly", by_weekday=["-1fr"])["byWeekday"] == ["-1FR"]
+
+
+def test_not_a_member_detail_shape_maps_to_its_code(client, monkeypatch):
+    """D7: the membership gate answers in the dependency `detail` shape."""
+    from tests._fakes import Err
+
+    r = install(monkeypatch)
+    r.add("GET", "/api/calendar-events",
+          Err(403, {"detail": {"code": "not_a_member", "message": "Not a member of this mesh."}}))
+    with pytest.raises(MeshbookError) as ei:
+        client.events.list()
+    assert (ei.value.status, ei.value.code) == (403, "not_a_member")
 
 
 def test_set_and_clear_recurrence_wire(client, monkeypatch):

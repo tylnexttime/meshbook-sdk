@@ -32,10 +32,10 @@ installs keep working):
 4. ``~/.meshbook``
 
 Writes are atomic (a temp file in the same directory, fsync, then
-``os.replace``), guarded by ``config.lock`` beside the file (best-effort,
-cross-platform, short timeout; a lock older than the stale threshold is
-treated as left behind by a crashed process and broken), and land with
-mode 600 on POSIX. Windows has no equivalent of that mode: the file
+``os.replace``), serialised by an OS advisory lock on ``config.lock``
+beside the file (``fcntl.flock`` / ``msvcrt.locking``; released by the OS
+if a writer dies, short timeout, then ``config_locked``), and land with
+mode 600 on POSIX. The lock file itself is left in place. Windows has no equivalent of that mode: the file
 inherits the profile directory's ACL (DPAPI protection is noted as open
 work, not done).
 """
@@ -44,6 +44,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import sys
 import tempfile
 import time
 from collections.abc import Iterator, Mapping
@@ -65,8 +66,8 @@ LOCK_FILENAME = "config.lock"
 
 #: How long a writer waits for the lock before giving up (seconds).
 LOCK_TIMEOUT = 5.0
-#: A lock file older than this is assumed orphaned by a crashed writer.
-#: Writes take milliseconds, so anything this old is not a live writer.
+#: Fallback lock only (no fcntl/msvcrt): an exclusive-create lock file
+#: older than this is assumed orphaned by a crashed writer.
 LOCK_STALE_AFTER = 15.0
 _LOCK_POLL = 0.05
 
@@ -141,51 +142,117 @@ def _read_for_update(p: Path) -> dict[str, Any]:
     return {}
 
 
+if sys.platform == "win32":
+    import msvcrt
+
+    def _try_os_lock(fd: int) -> bool | None:
+        """Non-blocking exclusive lock on byte 0: True held, False busy."""
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+
+    def _os_unlock(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+else:
+    _fcntl: Any
+    try:
+        import fcntl as _fcntl
+    except ImportError:  # pragma: no cover - exotic platforms (WASI …)
+        _fcntl = None
+
+    def _try_os_lock(fd: int) -> bool | None:
+        """Non-blocking exclusive flock: True held, False busy, None unsupported."""
+        if _fcntl is None:  # pragma: no cover
+            return None
+        try:
+            _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        except OSError:
+            return False
+        return True
+
+    def _os_unlock(fd: int) -> None:
+        if _fcntl is not None:
+            _fcntl.flock(fd, _fcntl.LOCK_UN)
+
+
+def _busy(lock: Path) -> MeshbookError:
+    return MeshbookError(
+        "config_locked",
+        f"{lock} is held by another meshbook process; try again in a moment.",
+    )
+
+
 @contextlib.contextmanager
-def _locked(
-    directory: Path,
-    timeout: float = LOCK_TIMEOUT,
-    stale_after: float = LOCK_STALE_AFTER,
-) -> Iterator[Path]:
+def _locked(directory: Path, timeout: float = LOCK_TIMEOUT) -> Iterator[Path]:
     """Hold ``config.lock`` in *directory* for the duration of the block.
 
-    ``O_CREAT | O_EXCL`` is atomic on every local filesystem Python
-    supports, which is all a best-effort lock needs. A lock older than
-    *stale_after* seconds is broken (a crashed writer); a live one makes
-    us wait up to *timeout* seconds and then raise ``config_locked``
-    rather than write over another process's change.
+    An OS advisory lock (``fcntl.flock`` on POSIX, ``msvcrt.locking`` on
+    Windows) on a lock file that is never deleted. The OS releases it when
+    the holder exits — even by crashing — so there is no staleness to
+    guess at. (The first version created and deleted the file and broke
+    "stale" locks by age; two waiters breaking the same stale lock could
+    both end up "holding" it.) A busy lock makes us wait up to *timeout*
+    seconds, then raise ``config_locked`` rather than write over another
+    process's change. Platforms with neither primitive fall back to
+    :func:`_locked_exclusive_create`.
     """
     lock = directory / LOCK_FILENAME
+    try:
+        fd = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        raise MeshbookError("config_write_failed", f"Cannot open {lock}: {e}") from e
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            got = _try_os_lock(fd)
+            if got is None:
+                break
+            if got:
+                try:
+                    yield lock
+                finally:
+                    with contextlib.suppress(OSError):
+                        _os_unlock(fd)
+                return
+            if time.monotonic() >= deadline:
+                raise _busy(lock)
+            time.sleep(_LOCK_POLL)
+    finally:
+        os.close(fd)
+    with _locked_exclusive_create(directory, timeout) as held:
+        yield held
+
+
+@contextlib.contextmanager
+def _locked_exclusive_create(directory: Path, timeout: float) -> Iterator[Path]:
+    """Fallback lock: ``O_CREAT | O_EXCL`` on ``config.lock.excl``, removed on
+    release; one older than LOCK_STALE_AFTER is assumed orphaned. Best-effort
+    by nature (two waiters can race to break the same stale file); used only
+    where the OS offers no advisory lock."""
+    lock = directory / (LOCK_FILENAME + ".excl")
     deadline = time.monotonic() + timeout
     while True:
         try:
             fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except (FileExistsError, PermissionError):
-            # PermissionError: on Windows, creating a file whose previous
-            # incarnation is still being deleted (the last holder just
-            # released it) is ACCESS_DENIED, not EEXIST. Same meaning: busy.
             try:
                 age = time.time() - lock.stat().st_mtime
             except OSError:
-                age = 0.0  # vanished or delete-pending: treat as live, retry
-            if age > stale_after:
+                age = 0.0
+            if age > LOCK_STALE_AFTER:
                 with contextlib.suppress(OSError):
                     lock.unlink()
                 continue
             if time.monotonic() >= deadline:
-                raise MeshbookError(
-                    "config_locked",
-                    f"{lock} is held by another process (or the directory is not "
-                    "writable). If no meshbook client is running, delete that file and "
-                    "try again.",
-                ) from None
+                raise _busy(lock) from None
             time.sleep(_LOCK_POLL)
             continue
-        try:
-            with contextlib.suppress(OSError):
-                os.write(fd, f"{os.getpid()}\n".encode("ascii"))
-        finally:
-            os.close(fd)
+        os.close(fd)
         break
     try:
         yield lock

@@ -63,20 +63,38 @@ def recurrence_rule(
         if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= 1000:
             raise MeshbookError("bad_argument", f"count must be an int in 1..1000, got {count!r}.")
         body["countN"] = count
+    if by_weekday is not None and by_month_day is not None:
+        raise MeshbookError("bad_argument", "Pass by_weekday= or by_month_day=, not both.")
     if by_weekday is not None:
         days = [str(d).strip().upper() for d in by_weekday if str(d).strip()]
         if not days:
             raise MeshbookError("bad_argument", "by_weekday must not be empty.")
         for d in days:
-            if d[-2:] not in WEEKDAYS:
-                raise MeshbookError("bad_argument", f"Unknown weekday {d!r} (use MO..SU).")
+            ordinal = d[:-2]
+            if d[-2:] not in WEEKDAYS or (ordinal and not _is_ordinal(ordinal)):
+                raise MeshbookError("bad_argument", f"Unknown weekday {d!r} (use MO..SU, or 3TH / -1FR).")
+            if ordinal and canon != "Monthly":
+                raise MeshbookError(
+                    "bad_argument", f"An ordinal weekday ({d}) only makes sense with Monthly."
+                )
         body["byWeekday"] = days
     if by_month_day is not None:
+        if canon != "Monthly":
+            raise MeshbookError("bad_argument", "by_month_day only makes sense with Monthly.")
         mdays = list(by_month_day)
         if not mdays:
             raise MeshbookError("bad_argument", "by_month_day must not be empty.")
+        for md in mdays:
+            if not isinstance(md, int) or isinstance(md, bool) or not (1 <= abs(md) <= 31):
+                raise MeshbookError("bad_argument", f"by_month_day values are 1..31 or -31..-1, got {md!r}.")
         body["byMonthDay"] = mdays
     return body
+
+
+def _is_ordinal(text: str) -> bool:
+    """``3`` or ``-1`` (the nth / nth-from-last weekday of the month)."""
+    t = text[1:] if text.startswith(("-", "+")) else text
+    return t.isdigit() and 1 <= int(t) <= 5
 
 
 def _recurrence_body(value: Any) -> Any:
