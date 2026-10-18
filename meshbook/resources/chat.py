@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import mimetypes
 import os
+import uuid as _uuid
 from pathlib import Path
 from typing import Any
 
@@ -218,6 +219,16 @@ class Channels(Namespace):
     #: 0.3 name, kept.
     _resolve = resolve
 
+    def _channel_id(self, channel: str, mesh: str | None) -> str:
+        """A channel ref → its id. A UUID (leading '#' tolerated) is used as
+        given, with no lookup: the server judges it where it is used, and
+        a caller that already holds the id must not pay a GET for it. A
+        name goes through :meth:`resolve`."""
+        target = (channel or "").lstrip("#").strip()
+        if _is_uuid(target):
+            return str(_uuid.UUID(target))  # canonical lower-case form
+        return str(self.resolve(channel, mesh=mesh)["id"])
+
     def create(
         self,
         name: str,
@@ -256,9 +267,9 @@ class Channels(Namespace):
         mesh: str | None = None,
     ) -> ItemList[dict[str, Any]]:
         """GET /api/channels/{id}/messages — newest first."""
-        ch = self.resolve(channel, mesh=mesh)
+        channel_id = self._channel_id(channel, mesh)
         return self._c._list(
-            "channels.messages", path={"channel_id": ch["id"]}, limit=limit, offset=offset, mesh=mesh
+            "channels.messages", path={"channel_id": channel_id}, limit=limit, offset=offset, mesh=mesh
         )
 
     def post(
@@ -271,11 +282,11 @@ class Channels(Namespace):
     ) -> dict[str, Any]:
         """POST /api/channels/{id}/messages. Broadcast channels are
         admin-post-only server-side (403 → MeshbookError)."""
-        ch = self.resolve(channel, mesh=mesh)
+        channel_id = self._channel_id(channel, mesh)
         body: dict[str, Any] = {"bodyMd": message}
         put_if(body, "parentMessageId", reply_to)
         return as_dict(
-            self._c._call("channels.post", path={"channel_id": ch["id"]}, body=body, mesh=mesh)
+            self._c._call("channels.post", path={"channel_id": channel_id}, body=body, mesh=mesh)
         )
 
     def reply(self, message_id: str, message: str, *, mesh: str | None = None) -> dict[str, Any]:
@@ -305,9 +316,9 @@ class Channels(Namespace):
     ) -> ItemList[dict[str, Any]]:
         """§88a — a channel's members (for private channels, the access list;
         the server refuses for channels you can't see)."""
-        ch = self.resolve(channel, mesh=mesh)
+        channel_id = self._channel_id(channel, mesh)
         return self._c._list(
-            "channels.members", path={"channel_id": ch["id"]}, limit=limit, offset=offset, mesh=mesh
+            "channels.members", path={"channel_id": channel_id}, limit=limit, offset=offset, mesh=mesh
         )
 
     def _member_id(self, user_id: str | None, user: str | None, mesh: str | None) -> str:
@@ -331,10 +342,10 @@ class Channels(Namespace):
         ``user_id`` is an id sent as-is (0.3); ``user`` takes a UUID,
         @username or display name. Returns the member list.
         """
-        ch = self.resolve(channel, mesh=mesh)
+        channel_id = self._channel_id(channel, mesh)
         uid = self._member_id(user_id, user, mesh)
         payload = self._c._call(
-            "channels.add_member", path={"channel_id": ch["id"]}, body={"userId": uid}, mesh=mesh
+            "channels.add_member", path={"channel_id": channel_id}, body={"userId": uid}, mesh=mesh
         )
         from ..client import _item_list
 
@@ -350,12 +361,12 @@ class Channels(Namespace):
     ) -> dict[str, Any]:
         """§88a — remove a member (creator/admin, or yourself to leave).
         User arguments as :meth:`add_member`."""
-        ch = self.resolve(channel, mesh=mesh)
+        channel_id = self._channel_id(channel, mesh)
         uid = self._member_id(user_id, user, mesh)
         return as_dict(
             self._c._call(
                 "channels.remove_member",
-                path={"channel_id": ch["id"], "user_id": uid},
+                path={"channel_id": channel_id, "user_id": uid},
                 mesh=mesh,
             )
         )
