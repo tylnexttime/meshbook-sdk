@@ -29,9 +29,9 @@ errors), with no printed noise and no `sys.exit`. See [Errors](#errors).
 | Variable | Meaning |
 |---|---|
 | `MESHBOOK_CONFIG_DIR` | config directory; else an existing `~/.meshbook`, else `$XDG_CONFIG_HOME/meshbook`, else `~/.meshbook` |
-| `MESHBOOK_BASE` | API base URL (apex domain only — `www.` 301s and turns POST into GET) |
+| `MESHBOOK_BASE` | API base URL: https, apex domain (plain http only for localhost; a redirect off-origin is refused) |
 | `MESHBOOK_TOKEN` | bearer token; beats the config file's `token` |
-| `MESHBOOK_MESH` | mesh for this process, by id or **name** |
+| `MESHBOOK_MESH` | mesh for this process, by id or **name** (set-but-empty is an error, not "unset") |
 
 Precedence, always: **explicit argument > environment > config file > default.**
 
@@ -42,15 +42,29 @@ The config file (`~/.meshbook/config`, JSON, utf-8) is owned by
 from meshbook import config
 config.config_dir()                       # resolved directory
 config.load_config()                      # {} if missing or unreadable
+config.load_config(strict=True)           # ...or raise config_unreadable for a broken file
 config.save_config({"base": "https://meshbook.org"})   # merge + atomic write
 config.save_config({"auth_mode": None})   # None deletes a key
+config.quarantine_config()                # move a broken file aside (config.bad.<UTC stamp>)
 config.reset_config()                     # `mesh logout` (agent keys untouched)
 ```
 
 Writes merge into what is on disk at that moment (unknown keys survive),
-are atomic (temp file + `os.replace`), are serialised by a `config.lock`
-beside the file, stamp `schema_version: 1`, and land mode 600 on POSIX.
+are atomic (temp file + `os.replace`), are serialised by an OS advisory
+lock on `config.lock` beside the file (`fcntl.flock` / `msvcrt.locking`,
+released by the OS if a writer dies; the lock file is never deleted, so do
+not clean it up), stamp `schema_version: 1`, and land mode 600 on POSIX.
 On Windows the file inherits the profile directory's ACL.
+
+A config that cannot be read or parsed is re-read briefly first (an older,
+unlocked client may be mid-rewrite). If it is still broken, **nothing is
+written over it**: `save_config` raises `config_unreadable` (the file may
+hold your token), and a client with no other token reports
+`config_unreadable` with the path rather than "no API token". Repair it by
+hand, or call `config.quarantine_config()`, which renames it to
+`config.bad.<UTC stamp>` (never overwriting an earlier copy) so a fresh one
+can be written. `reset_config()` also removes those copies and orphaned
+temp files.
 
 ## Which mesh a call acts in
 
@@ -76,8 +90,15 @@ client.meshes.use("Work")                   # switch this client (verified first
 client.meshes.use("Work", persist=True)     # …and write it to the config file
 ```
 
+**In unattended code, always pass `mesh=`** (or `Client(mesh=...)`): the
+config's mesh is whatever someone last persisted. An EMPTY value
+(`mesh=""`, or `MESHBOOK_MESH=` from an unset shell variable) raises
+`bad_argument`; it never falls through to the config's mesh.
+
 Per-call `mesh=`, `Client(mesh=)` and `MESHBOOK_MESH` never write the
-config file. Account-level calls (`/api/me`, the mesh list, the agent lane)
+config file. `meshes.use(..., persist=True)` while `MESHBOOK_MESH` names a
+different mesh warns, and the returned `Mesh` carries `env_override`: new
+clients in that environment will keep using `MESHBOOK_MESH`. Account-level calls (`/api/me`, the mesh list, the agent lane)
 never send a mesh header at all: under a mesh-scoped token a stale header
 would 403 the very calls you need to recover.
 
@@ -90,14 +111,28 @@ working) that also carries the envelope:
 ```python
 rows = client.contacts.list(q="ada", limit=20, offset=40)
 rows.total, rows.limit, rows.offset   # server total (None for bare lists), the paging asked for
+rows.total_exact                      # True when .total is the full count, not the page length
 rows.has_more                         # best available "is there another page?"
+rows.next_offset                      # offset= for the next page
 rows.meta                             # other envelope keys: page, pageSize, truncated, …
 ```
 
-Every list method takes `limit=` and `offset=`. Servers before the
-2026-10-19 release report the page length as `total` on most lists, so
-`has_more` (which also fires on a full page) is the honest signal there. If a server ignores `limit`, the page is cut client-side
-so `limit=` means the same thing everywhere.
+List methods take `limit=` and `offset=`, except the cursor-paged message
+routes: `chat.list`, `channels.read` and `dms.read` page by `limit=` and
+`before=` (an aware datetime or ISO string, e.g. the oldest row's
+`createdAt`), and `chat.search` and `users.list` take `limit=` only. On
+those, `offset=` raises `bad_argument` (the server would ignore it and
+return the first page again). Servers before the 2026-10-19 release report
+the page length as `total` on most lists; `total_exact` tells you which
+you got, and `has_more` (which also fires on a full page) is the honest
+signal when it is False. If a server ignores `limit`, the page is cut
+client-side so `limit=` means the same thing everywhere.
+
+`tasks.list_mine(open_only=True)` filters closed tasks out of the page
+client-side (the server's `status=` matches one status), so its result
+can be shorter than `limit` while more pages exist: it reports
+`total=None` and `meta["server_rows"]`, and `next_offset` / `has_more`
+follow the server's page. Use `next_offset` to page on.
 
 Four stable shapes are frozen dataclasses with the full payload in `.raw`:
 `User`, `Mesh`, `ExportJob`, `Attachment`.
@@ -113,8 +148,36 @@ Four stable shapes are frozen dataclasses with the full payload in `.raw`:
   `max(timeout, 120)`) for files.
 - **Agent tokens:** a 401 on a self-minted token triggers exactly one
   re-mint and retry.
+- **Redirects:** followed only for GET/HEAD and only on the same origin;
+  anything else raises `redirect_refused` naming the Location (credentials
+  never travel to another host, and a write is never silently re-sent as a
+  GET).
+- **https only:** a base that is not https raises `insecure_base` (plain
+  http is allowed for localhost / 127.0.0.1 / ::1 / `*.localhost`).
+- **Network failures** are always `network_error`; when a WRITE failed after
+  it may have reached the server, the hint is `check_before_retry`.
+- A non-default base or a mesh is logged once at INFO with its source
+  (`client.base_source`, `client.mesh_source`).
 - `Client(user_agent="mytool/1.0")` puts your product token in front of
   `meshbook-sdk/<version>` (Cloudflare blocks default library UAs).
+
+## Downloads
+
+```python
+path = client.files.download(att_id, "downloads/")          # server's name, inside downloads/
+path = client.chat.download(att_id, "out/spec.pdf", overwrite=True)
+name, data = client.files.download_bytes(att_id)            # in memory, nothing written
+```
+
+`files`, `chat` and `exports` all have `download()` and `download_bytes()`.
+The server's filename is chosen by whoever uploaded the attachment, so it
+is reduced by `meshbook.safe_filename()` to one safe path component (the
+same result on Windows and POSIX: no `..`, no separators, no drive or
+device names, no control characters), and the final path must resolve
+directly inside the target directory (`unsafe_path` otherwise). An
+existing file is never replaced unless `overwrite=True` (`file_exists`);
+the write is atomic. `download_raw()` returns the server's name
+unsanitised: pass it through `safe_filename()` before using it.
 
 ## Times
 
@@ -213,6 +276,14 @@ own 5-minute tokens for every call, re-mints 30 s before expiry (or on one
 `auth="agent"` never falls back. Keys are written atomically, mode 600 from
 birth; replaced keys are kept as `.bak`. `client.agent.kid_prefix` labels
 which client minted a key.
+
+The server switches a seat to a new key before it answers `enroll` or
+`register`, so the new key is written to `agent-key.pem.pending` BEFORE the
+call and promoted on success. If the answer is lost (a timeout, a 500),
+the pending key stays: `token()` tries it automatically when the live key
+stops working, `client.agent.recover_pending()` does so on demand, and
+`client.agent.discard_pending()` drops it. A new enroll/register refuses
+(`pending_key`) until it is settled.
 
 ## Errors
 
@@ -322,18 +393,24 @@ A 401 without a mapped code gets the hint `reauthenticate`;
 `scripts/contract_check.py` (stdlib only) checks that every `(method, path)`
 the SDK can send exists in the pinned OpenAPI snapshot
 `tests/contract/openapi.json`; CI runs it. Every SDK request goes through the
-endpoint registry `meshbook._endpoints`, so the check reads that instead of
-guessing at call sites. `--scan DIR` checks hand-built calls in other code
+endpoint registry, so the check reads that instead of guessing at call
+sites. The registry is public and read-only as `meshbook.endpoints`
+(`ENDPOINTS`, `calls()`, `path(key, **params)`); wrappers should import
+that, not `meshbook._endpoints`. The test suite also checks every query
+parameter it sends against the spec. `--scan DIR` checks hand-built calls in other code
 (the CLI and MCP can vendor the file); `scripts/refresh_openapi.py` re-pins
 the snapshot.
 
 ## Escape hatch
 
 ```python
-payload = client.request("GET", "/api/saved-views", params={"entityType": "leads"})
+payload = client.request("GET", "/api/saved-views", params={"module": "leads"})
+from meshbook import endpoints
+content, name = client.download_raw(endpoints.path("files.download", attachment_id=aid))
 ```
 
 Unchecked by the contract check, and envelope not stripped.
+`client.me_id()` is your own user id, cached per client.
 
 ## Gotchas worth knowing
 
@@ -352,6 +429,48 @@ Unchecked by the contract check, and envelope not stripped.
 - `chat.search()` returns a `SearchResults` ItemList (`.semantic`,
   `.total`); the 0.3 `res["items"]` keys still work with a
   DeprecationWarning.
+
+## Upgrading
+
+### From 0.4.0 to 0.4.1
+
+- **Downloads** no longer overwrite an existing file: pass `overwrite=True`
+  where you relied on that (`file_exists` otherwise). Directory downloads
+  use a sanitised server filename.
+- `offset=` on `chat.list`, `channels.read`, `dms.read`, `chat.search` and
+  `users.list` raises `bad_argument` (it was silently ignored); use
+  `before=` on the first three.
+- An empty `mesh=""` / `MESHBOOK_MESH=""` raises `bad_argument`.
+- A non-https base raises `insecure_base`; a cross-origin redirect, or any
+  redirect of a write, raises `redirect_refused`.
+- A broken config is never overwritten: `save_config` raises
+  `config_unreadable` (0.4.0 renamed it to `config.bad` and wrote only the
+  update). Use `config.quarantine_config()` to repair.
+- `tasks.log_time()` defaults to the LOCAL date (0.4.0: UTC).
+- `saved_views.list(module)` filters by `module` (0.4.0 sent `entityType`,
+  which the server ignores); `entity=` still works, deprecated.
+- `tasks.list_mine(open_only=True)` without `status=` returns
+  `total=None`; page with `next_offset`.
+
+### From 0.3 to 0.4
+
+Changes that can send traffic or writes somewhere new:
+
+- **`MESHBOOK_BASE` and the config's `base` are honoured by default** (0.3
+  needed `base=None`). A leftover dev base in `~/.meshbook/config` now
+  captures every call: check `client.base_source` (logged at INFO).
+- **The mesh can come from `MESHBOOK_MESH`** (new) or the config, and names
+  are accepted. `meshes.members(mesh)` **no longer switches** the client's
+  active mesh (0.3 did): a 0.3 script that relied on it now writes into the
+  previous mesh. Pass `mesh=` explicitly.
+- A client built with no token argument uses the agent lane when the config
+  says `auth_mode: "agent"` (what `persist=True` and the CLI write).
+- Account-level calls (`/api/me`, the mesh list, the agent routes) no
+  longer send `X-Active-Mesh-Id`.
+- Lists return `ItemList` (still a `list`); `chat.search()` returns
+  `SearchResults` (the 0.3 dict keys work with a DeprecationWarning).
+- 429/503 are retried for GET/HEAD/PUT/DELETE (never POST/PATCH).
+- Local validation errors use the code `bad_argument`.
 
 ## Related
 

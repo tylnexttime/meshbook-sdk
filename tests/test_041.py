@@ -462,3 +462,25 @@ def test_contract_check_accepts_the_public_registry():
     )
     assert out.returncode == 0, out.stdout + out.stderr
     assert "OK" in out.stdout
+
+
+# ─── critique C-20: where base and mesh came from is visible ───────────
+
+
+def test_non_default_base_and_mesh_sources_are_logged_once(tmp_path, monkeypatch, caplog):
+    import json
+    import logging
+
+    cfg = tmp_path / "cfg"
+    cfg.write_text(json.dumps({"base": "https://dev.example", "active_mesh_id": MESH}),
+                   encoding="utf-8")
+    with caplog.at_level(logging.INFO, logger="meshbook"):
+        c = MeshbookClient(token="t", config_path=cfg)
+    assert c.base_source == "config" and c.mesh_source == "config"
+    text = caplog.text
+    assert "https://dev.example (from config)" in text and f"{MESH} (from config)" in text
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="meshbook"):
+        d = MeshbookClient(token="t", config_path=tmp_path / "none")
+    assert d.base_source == "default" and caplog.text == ""
+

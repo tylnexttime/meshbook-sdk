@@ -662,7 +662,12 @@ class MeshbookClient:
         self.token: str | None = token or env_token or cfg_token
 
         cfg_base = cfg.get("base") if isinstance(cfg.get("base"), str) else None
-        resolved_base = base or os.environ.get("MESHBOOK_BASE") or cfg_base or DEFAULT_BASE
+        env_base = os.environ.get("MESHBOOK_BASE") or None
+        resolved_base = base or env_base or cfg_base or DEFAULT_BASE
+        #: Where the base came from: "argument", "env", "config" or "default".
+        self.base_source = (
+            "argument" if base else "env" if env_base else "config" if cfg_base else "default"
+        )
         self.base = _check_base(resolved_base)
 
         # ── mesh precedence: Client(mesh/active_mesh_id) > env > config ──
@@ -700,6 +705,18 @@ class MeshbookClient:
         elif cfg_mesh:
             # The config key is an id by definition (only meshes.use writes it).
             self._active_mesh_id, self.mesh_source = cfg_mesh, "config"
+
+        # Say once, at INFO, where a non-default base or a mesh came from: a
+        # leftover dev base in the config, or a MESHBOOK_MESH exported in a
+        # shell profile, silently redirects every call (critique C-20).
+        if self.base_source != "default":
+            log.info("meshbook base %s (from %s)", self.base, self.base_source)
+        if self.mesh_source is not None:
+            log.info(
+                "meshbook mesh %s (from %s)",
+                self._active_mesh_id or self._pending_mesh_ref,
+                self.mesh_source,
+            )
 
         # ── auth lane ──
         self._agent_fallback = False
