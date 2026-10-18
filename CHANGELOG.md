@@ -3,6 +3,96 @@
 All notable changes to meshbook-sdk are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow [SemVer](https://semver.org/).
 
+## [0.4.0] - 2026-10-19
+
+The SDK becomes the single Python core: meshbook-cli 0.12 and meshbook-mcp 0.8
+depend on `meshbook-sdk>=0.4,<0.5` and delete their own config, HTTP, envelope,
+error-mapping, agent-lane and name-resolution code.
+
+### Added
+- **`meshbook.config`** — the one owner of `~/.meshbook/config`: `config_dir()`,
+  `config_path()`, `load_config()`, `save_config(updates)`, `reset_config()`.
+  utf-8 (BOM tolerated), `schema_version: 1`, unknown keys preserved, `None`
+  deletes a key, atomic writes (temp + `os.replace`) under a `config.lock`
+  (best-effort, short timeout, stale locks broken), mode 600 on POSIX. A read
+  error during an update raises instead of writing back a config without the
+  token; a corrupt file is kept as `config.bad`.
+- **Per-call mesh override (DEV-DEBT §102.1):** `mesh=` on every mesh-scoped
+  method, `Client(mesh=...)`, `MESHBOOK_MESH`; ids or names. Names resolve
+  case-insensitively over your meshes (cached per client); `mesh_not_found` /
+  `mesh_ambiguous`, never a guess. `meshes.use(..., persist=True)` is the only
+  path that writes the mesh to the config.
+- **`ItemList`** for every list method (a `list` subclass with `.total`,
+  `.limit`, `.offset`, `.meta`, `.has_more`, `.truncated`); `limit=`/`offset=`
+  on every list method; bare-list endpoints normalised too (§102.8).
+- **Retries:** 429/503 retried (max 3 attempts, `max_attempts=`), honouring
+  `Retry-After` in seconds or as an HTTP date, capped at 30 s; GET/HEAD/PUT/DELETE
+  only, never POST/PATCH. `download_timeout=`.
+- **Calendar events** (`client.events`, CALENDAR-CONTRACT 2026-10-19): `list`
+  (window, `expand` with occurrences, `tz`, linked entity, owner), `get`,
+  `create` (attendees, recurrence, `dedupe=` guard), `update` (PATCH; attendees
+  replace, `recurrence=None` clears), `delete`, `set_recurrence` /
+  `clear_recurrence` (count, by-weekday, by-month-day), `attendees`,
+  `add_attendee`, `update_attendee` (RSVP), `remove_attendee`, `find_duplicates`;
+  `meshbook.recurrence_rule()`.
+- **§102 surface:** `tasks.create(due=, assignee=, tags=, parent=, project=)`,
+  `tasks.update`, `tasks.get`, `tasks.delete`, `tasks.log_time`,
+  `tasks.list(sort=, search=, assignee=, project=)`, `tasks.list_mine(open_only=)`;
+  `projects` list/get/create/update/archive/members/add_member/remove_member/
+  delete/resolve; `contacts` get/update/delete/resolve and create with phone,
+  title, job title (`role`), notes, tags; `companies` list/create/get/update/
+  delete/contacts; `leads` get/update/delete, default pipeline + stage names;
+  `pipelines` list/default/resolve_stage; `tags` list/of/attach/detach/add/set.
+- Everything the CLI and MCP did by hand: `users.list/resolve`, membership
+  (`meshes.resolve/pending_invitations/invite/respond/set_role/remove_member/
+  leave`), `channels.create/reply/resolve` and members by name, `dms`
+  (list/open/read/send), `chat.unreact/get_message` and entity threads,
+  `files.link`, `custom_fields.list`, `saved_views.list/create`,
+  `notifications.list(unread_only=, group=, kind=)`, `client.health()`.
+- **Agent lane completed** so the CLI's and MCP's copies can go: `agent.ready()`,
+  `agent.kid_prefix`, `persist=True` on `enroll`/`register`/`revoke` (writes or
+  clears `auth_mode`), config-driven agent mode (`auth_mode: "agent"`) with the
+  stored bearer as fallback, one re-mint on a 401, `Client.auth_mode`.
+- `Client` alias, `user_agent=` prefix, `meshbook.UNSET`, `py.typed`
+  ("Typing :: Typed").
+- **Contract check (F3):** the endpoint registry `meshbook._endpoints` (every
+  request goes through it), `scripts/contract_check.py` (stdlib, vendorable;
+  registry / AST-scan / JSON modes), `scripts/refresh_openapi.py`, the pinned
+  `tests/contract/openapi.json`, and a CI step.
+
+### Changed
+- `MESHBOOK_BASE` and the config file's `base` are honoured by default (0.3
+  needed `base=None`). Precedence everywhere: argument > env > config > default.
+- `/api/me`, `/api/meshes`, `POST /api/meshes/active`, the pending-invitation
+  list and the agent routes no longer send `X-Active-Mesh-Id` (a scoped token
+  with a stale mesh 403'd them).
+- `meshes.members(mesh)` no longer switches the client's active mesh.
+- `exports.start/list` send the target mesh as the header without mutating the
+  client; they also take `mesh=` (id or name).
+- `chat.search()` returns `SearchResults` (an ItemList with `.semantic`); the
+  0.3 dict keys still work for this minor, with a DeprecationWarning.
+- `channels.add_member/remove_member` take `user=` (name or id) besides the 0.3
+  `user_id`; `leads.create/move_stage` take `stage=` (name or id) besides
+  `stage_id`; `leads.create` defaults to the default pipeline's first stage.
+- Agent key and bundle are written atomically with mode 600 from birth;
+  `register(force=True)` keeps the replaced key as `.bak`; the bundle's kid falls
+  back to the local kid when the server echoes none; token lifetime is the
+  earlier of `expires_in` and the JWT's `exp`; the mint carries the client's
+  User-Agent.
+- Error mapping: FastAPI's 422 detail list → `validation_error`; a non-JSON 200
+  → `bad_response`; a missing upload file → `file_not_found`. Local validation
+  errors use `bad_argument` (parity with @meshbook/sdk).
+- Downloads create missing parent directories.
+- Dev tooling: ruff pinned `>=0.17,<0.18`, mypy `>=2.4,<2.5` (0 errors at
+  default settings, in CI); the publish job refuses a tag that differs from
+  pyproject's version.
+
+### Notes
+- Calendar PATCH/recurrence/attendee routes, project members and the
+  server-side task sort are on the meshbook server branch released alongside
+  this SDK; against an older server those calls return 404/405 (the task sort
+  is mirrored client-side on the page).
+
 ## [0.3.0] - 2026-08-28
 
 ### Changed
