@@ -231,3 +231,28 @@ def test_empty_per_call_mesh_is_bad_argument(client, monkeypatch):
         client.meshes.leave(mesh="")
     assert ei.value.code == "bad_argument"
     assert r.requests == []
+
+
+# ─── gap 4: a public, cached me_id() ──────────────────────────────────
+
+
+def test_me_id_is_cached_per_client(client, monkeypatch):
+    r = install(monkeypatch)
+    r.add("GET", "/api/me", ok({"authenticated": True, "user": {"id": U1}}))
+    assert client.me_id() == U1
+    assert client.me_id() == U1
+    assert len(r.calls("GET", "/api/me")) == 1
+    assert client.me_id(refresh=True) == U1
+    assert len(r.calls("GET", "/api/me")) == 2
+
+
+def test_me_id_after_whoami_costs_nothing_and_no_user_raises(client, monkeypatch):
+    r = install(monkeypatch)
+    r.add("GET", "/api/me", ok({"authenticated": True, "user": {"id": U1, "username": "w"}}))
+    client.whoami()
+    assert client.me_id() == U1 and len(r.requests) == 1
+    r2 = install(monkeypatch)
+    r2.add("GET", "/api/me", ok({"authenticated": True, "user": {}}))
+    with pytest.raises(MeshbookError) as ei:
+        client.me_id(refresh=True)
+    assert ei.value.code == "no_user"

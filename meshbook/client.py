@@ -1185,10 +1185,24 @@ class MeshbookClient:
             raise MeshbookError("no_user", "Authenticated but /api/me returned no user.", 200)
         return User.from_api(user)
 
-    def _self_user_id(self) -> str:
-        if self._me_cache is None:
+    def me_id(self, *, refresh: bool = False) -> str:
+        """Your own user id, from ``GET /api/me``, cached per client.
+
+        The first call (or ``refresh=True``) costs one request; later calls
+        are free, as is any call after :meth:`me` / :meth:`whoami` already
+        fetched it. Raises ``no_user`` when /api/me names no user, and
+        ``not_authenticated`` for a bad token.
+        """
+        if refresh or self._me_cache is None:
             self.me()
-        return str(((self._me_cache or {}).get("user") or {}).get("id") or "")
+        uid = str(((self._me_cache or {}).get("user") or {}).get("id") or "")
+        if not uid:
+            raise MeshbookError("no_user", "Authenticated but /api/me returned no user id.", 200)
+        return uid
+
+    def _self_user_id(self) -> str:
+        """0.4.0 private spelling of :meth:`me_id`, kept for callers that used it."""
+        return self.me_id()
 
 
 #: The contract's spelling.
