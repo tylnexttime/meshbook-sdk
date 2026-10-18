@@ -66,11 +66,21 @@ class Tags(Namespace):
         """GET /api/tags — the mesh's tag dictionary."""
         return self._c._list("tags.list", limit=limit, offset=offset, mesh=mesh)
 
-    def of(self, entity_type: str, entity_id: str, *, mesh: str | None = None) -> ItemList[dict[str, Any]]:
+    def of(
+        self,
+        entity_type: str,
+        entity_id: str,
+        *,
+        limit: int | None = None,
+        offset: int | None = None,
+        mesh: str | None = None,
+    ) -> ItemList[dict[str, Any]]:
         """GET /api/entities/{type}/{id}/tags — the tags on one entity."""
         return self._c._list(
             "tags.entity_list",
             path={"entity_type": entity_type, "entity_id": entity_id},
+            limit=limit,
+            offset=offset,
             mesh=mesh,
         )
 

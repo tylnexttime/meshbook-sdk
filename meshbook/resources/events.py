@@ -409,9 +409,19 @@ class Events(Namespace):
             self._c._call("events.clear_recurrence", path={"event_id": event_id}, mesh=mesh)
         )
 
-    def attendees(self, event_id: str, *, mesh: str | None = None) -> ItemList[dict[str, Any]]:
-        """GET /api/calendar-events/{id}/attendees (not paginated server-side)."""
-        return self._c._list("events.attendees", path={"event_id": event_id}, mesh=mesh)
+    def attendees(
+        self,
+        event_id: str,
+        *,
+        limit: int | None = None,
+        offset: int | None = None,
+        mesh: str | None = None,
+    ) -> ItemList[dict[str, Any]]:
+        """GET /api/calendar-events/{id}/attendees (not paginated server-side,
+        so ``limit``/``offset`` page the full list client-side)."""
+        return self._c._list(
+            "events.attendees", path={"event_id": event_id}, limit=limit, offset=offset, mesh=mesh
+        )
 
     def add_attendee(
         self,
