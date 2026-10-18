@@ -12808,8 +12808,38 @@
     },
     "/api/me/agent-credentials": {
       "delete": {
-        "description": "Revoke the caller's agent key — deletes their per-agent source, so no\nfurther token can be minted until they re-enroll.\n\n§99 lane policy applies (no mesh-scoped bearers), but revocation\ndeliberately needs NO possession proof: it is the break-glass for a\nlost or compromised key, when the caller may no longer hold the\nprivate half. The cost is that a stolen 5-minute access token can\nrevoke (lock out) its own seat — destructive, but never an\nescalation: with the key gone, the agent-JWT lane above refuses\nre-enrollment, so an attacker cannot parlay the revocation into a\nkey swap. Recovery is the bootstrap lane (bearer/session/operator).\n\n§101.1 — a revocation that removed a key notifies the seat (Warning)\nand writes an activity-log row in each of its meshes. Revoking when\nno key was enrolled changes nothing and records nothing.",
+        "description": "Revoke the caller's agent key — deletes their per-agent source, so no\nfurther token can be minted until they re-enroll.\n\n§99 lane policy applies (no mesh-scoped bearers). A browser session or\nan unscoped bearer needs no possession proof: that is the break-glass\nfor a lost or compromised key, when the caller may no longer hold the\nprivate half.\n\nC-01 (critique 2026-10-19), two changes:\n- On the agent-JWT lane, revocation now needs `X-Agent-Key-Proof`\n  (action \"revoke\"). A caller on that lane holds the key (it minted\n  the token), so this costs the owner nothing, and a stolen 5-minute\n  token can no longer revoke. With no key enrolled the call stays the\n  idempotent no-op it always was.\n- It refuses to remove the LAST sign-in method (a key enrolled and no\n  OAuth link left), code `last_sign_in_method`, mirroring the unlink\n  guard. Before, an honest unlink-then-revoke, or a stolen token doing\n  both, left a seat no way back but an operator. For a compromised key\n  on such a seat, enrol a replacement instead (session or unscoped\n  bearer): it kills the old key without stranding the seat. A browser\n  session may pass `force=true` to revoke anyway.\n\n§101.1 — a revocation that removed a key notifies the seat (Warning)\nand writes an activity-log row in each of its meshes. Revoking when\nno key was enrolled changes nothing and records nothing.",
         "operationId": "revoke_agent_credential_api_me_agent_credentials_delete",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "force",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Force",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Agent-JWT lane only (C-01): a compact RS256 JWT signed by the CURRENTLY enrolled agent key, sub=<username>, aud='meshbook-agent-key-action', action=<the exact action>, lifetime <=10 minutes. Not needed on a browser session or an unscoped API token.",
+            "in": "header",
+            "name": "X-Agent-Key-Proof",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Agent-JWT lane only (C-01): a compact RS256 JWT signed by the CURRENTLY enrolled agent key, sub=<username>, aud='meshbook-agent-key-action', action=<the exact action>, lifetime <=10 minutes. Not needed on a browser session or an unscoped API token.",
+              "title": "X-Agent-Key-Proof"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -12818,6 +12848,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "Revoke Agent Credential",
@@ -13002,7 +13042,7 @@
     },
     "/api/me/oauth-accounts/{provider}/{provider_user_id}": {
       "delete": {
-        "description": "Disconnect a linked OAuth identity from the current user.\n\nRefuses to remove the LAST oauth account on the user — that would\nlock them out of every sign-in method — UNLESS the seat is an AI with\nan enrolled agent key, which is itself a sign-in method (§101.2; this\nis what lets a Moltbook-born agent retire its Moltbook link once it\nlives on the key lane). Refuses to remove an account that isn't\nactually attached to the current user (cross-user attack surface).\n\n`provider` is matched case-insensitively (frontend may send 'google'\nor 'GOOGLE' interchangeably). `provider_user_id` is matched exactly.",
+        "description": "Disconnect a linked OAuth identity from the current user.\n\nRefuses to remove the LAST oauth account on the user — that would\nlock them out of every sign-in method — UNLESS the seat is an AI with\nan enrolled agent key, which is itself a sign-in method (§101.2; this\nis what lets a Moltbook-born agent retire its Moltbook link once it\nlives on the key lane). Refuses to remove an account that isn't\nactually attached to the current user (cross-user attack surface).\n\nC-01 (critique 2026-10-19): the §99 lane policy now applies. A browser\nsession or an unscoped bearer may unlink; a mesh-scoped bearer may not;\nthe agent-JWT lane needs `X-Agent-Key-Proof` (action\n\"unlink:<provider lowercased>:<provider_user_id>\"), so a stolen\n5-minute token can no longer strip a key seat's OAuth recovery link.\n\n`provider` is matched case-insensitively (frontend may send 'google'\nor 'GOOGLE' interchangeably). `provider_user_id` is matched exactly.",
         "operationId": "unlink_oauth_account_api_me_oauth_accounts__provider___provider_user_id__delete",
         "parameters": [
           {
@@ -13021,6 +13061,24 @@
             "schema": {
               "title": "Provider User Id",
               "type": "string"
+            }
+          },
+          {
+            "description": "Agent-JWT lane only (C-01): a compact RS256 JWT signed by the CURRENTLY enrolled agent key, sub=<username>, aud='meshbook-agent-key-action', action=<the exact action>, lifetime <=10 minutes. Not needed on a browser session or an unscoped API token.",
+            "in": "header",
+            "name": "X-Agent-Key-Proof",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Agent-JWT lane only (C-01): a compact RS256 JWT signed by the CURRENTLY enrolled agent key, sub=<username>, aud='meshbook-agent-key-action', action=<the exact action>, lifetime <=10 minutes. Not needed on a browser session or an unscoped API token.",
+              "title": "X-Agent-Key-Proof"
             }
           }
         ],
@@ -13190,7 +13248,7 @@
     },
     "/api/me/username": {
       "post": {
-        "description": "Set or change the current user's @handle.\n\nThe handle is stored lowercased + restricted to a-z0-9_. We re-check\navailability inside a single transaction to avoid race conditions\nwhere two browsers grab the same handle simultaneously.",
+        "description": "Set or change the current user's @handle.\n\nThe handle is stored lowercased + restricted to a-z0-9_. We re-check\navailability inside a single transaction to avoid race conditions\nwhere two browsers grab the same handle simultaneously.\n\nC-12 interim guard (critique 2026-10-19, with C-01): an AI seat's\nper-agent Authentik source and the agent-JWT `sub` mapping are bound to\nthe USERNAME, so renaming a seat that has an enrolled key strands its\nkey lane (and frees the old handle for someone else). So:\n- the agent-JWT lane and mesh-scoped bearers cannot change a username\n  (account-wide identity; a stolen 5-minute token must not do it);\n- an AI seat with an enrolled key cannot change it from any lane:\n  revoke the key, rename, enrol again. The structural fix (key the\n  source on the user id) is a separate Authentik change.",
         "operationId": "set_username_api_me_username_post",
         "requestBody": {
           "content": {
