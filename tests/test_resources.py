@@ -434,8 +434,11 @@ def test_notifications_files_views_fields_health(client, monkeypatch, tmp_path):
     assert r.query() == {"limit": "10", "unreadOnly": "true"}
     client.files.link("lead", A1, "https://example.org/x", "spec")
     assert r.body() == {"url": "https://example.org/x", "filename": "spec"}
-    client.saved_views.list("lead")
-    assert r.query() == {"entityType": "lead"}
+    client.saved_views.list("leads")
+    assert r.query() == {"module": "leads"}  # 0.4.0 sent entityType: ignored by the route
+    with pytest.warns(DeprecationWarning):
+        client.saved_views.list(entity="tasks")
+    assert r.query() == {"module": "tasks"}
     client.saved_views.create("leads", "Hot", {"stage": "New"}, shared=True)
     assert r.body() == {"module": "leads", "name": "Hot", "filterJson": {"stage": "New"},
                         "isShared": True}

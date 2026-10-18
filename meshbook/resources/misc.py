@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -228,15 +229,31 @@ class SavedViews(Namespace):
 
     def list(
         self,
-        entity: str | None = None,
+        module: str | None = None,
         *,
+        entity: str | None = None,
         limit: int | None = None,
         offset: int | None = None,
         mesh: str | None = None,
     ) -> ItemList[dict[str, Any]]:
-        """GET /api/saved-views."""
+        """GET /api/saved-views, optionally filtered by ``module`` (the
+        grouping :meth:`create` takes: leads / contacts / tasks …).
+
+        0.4.0 sent this filter as ``entityType``, which the route does not
+        read, so every view came back whatever was asked. ``entity=`` is the
+        0.4.0 keyword, kept as a deprecated alias for ``module``.
+        """
+        if entity is not None:
+            if module is not None and module != entity:
+                raise MeshbookError("bad_argument", "Pass module= or entity=, not both.")
+            warnings.warn(
+                "saved_views.list(entity=) is deprecated; the server filters by module=",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            module = entity
         return self._c._list(
-            "saved_views.list", params={"entityType": entity}, limit=limit, offset=offset, mesh=mesh
+            "saved_views.list", params={"module": module}, limit=limit, offset=offset, mesh=mesh
         )
 
     def create(
