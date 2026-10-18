@@ -224,3 +224,34 @@ def test_save_config_defaults_to_the_resolved_path(tmp_path, monkeypatch):
     cfgmod.save_config({"base": "https://meshbook.org"})
     assert cfgmod.load_config()["base"] == "https://meshbook.org"
     assert (tmp_path / "cfg" / "config").exists()
+
+
+def test_an_unreadable_config_is_never_overwritten(tmp_path, monkeypatch):
+    """If the read half of read-modify-write fails, writing back {updates}
+    would silently drop the token. Refuse instead."""
+    p = tmp_path / "config"
+    cfgmod.save_config({"token": "mb_token_keep"}, p)
+    before = p.read_bytes()
+    real_read_text = Path.read_text
+
+    def flaky(self, *a, **kw):
+        if self == p:
+            raise PermissionError(13, "Permission denied")
+        return real_read_text(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", flaky)
+    with pytest.raises(MeshbookError) as ei:
+        cfgmod.save_config({"active_mesh_id": "m-1"}, p)
+    assert ei.value.code == "config_write_failed"
+    monkeypatch.undo()
+    assert p.read_bytes() == before
+
+
+def test_a_corrupt_config_is_kept_aside_and_replaced(tmp_path):
+    """A broken file must not block `mesh login` from repairing it, and must
+    not be destroyed either."""
+    p = tmp_path / "config"
+    p.write_text("{half a json", encoding="utf-8")
+    cfgmod.save_config({"token": "t"}, p)
+    assert cfgmod.load_config(p)["token"] == "t"
+    assert (tmp_path / "config.bad").read_text(encoding="utf-8") == "{half a json"

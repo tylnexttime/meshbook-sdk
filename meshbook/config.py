@@ -114,6 +114,33 @@ def load_config(path: str | os.PathLike[str] | None = None) -> dict[str, Any]:
     return loaded if isinstance(loaded, dict) else {}
 
 
+def _read_for_update(p: Path) -> dict[str, Any]:
+    """The current file, for a read-modify-write under the lock.
+
+    Stricter than :func:`load_config`, because an empty answer here would
+    be WRITTEN BACK: a transient read error must not turn into a config
+    holding only the update (the token gone). Missing → ``{}``; unreadable
+    → ``config_write_failed``; not a JSON object → the bad file is kept as
+    ``config.bad`` and replaced (so a broken config never blocks
+    ``mesh login`` from repairing it).
+    """
+    try:
+        text = p.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError) as e:
+        raise MeshbookError("config_write_failed", f"Cannot read {p} to update it: {e}") from e
+    try:
+        loaded = json.loads(text)
+    except json.JSONDecodeError:
+        loaded = None
+    if isinstance(loaded, dict):
+        return loaded
+    with contextlib.suppress(OSError):
+        os.replace(p, p.with_name(p.name + ".bad"))
+    return {}
+
+
 @contextlib.contextmanager
 def _locked(
     directory: Path,
@@ -133,11 +160,14 @@ def _locked(
     while True:
         try:
             fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
+        except (FileExistsError, PermissionError):
+            # PermissionError: on Windows, creating a file whose previous
+            # incarnation is still being deleted (the last holder just
+            # released it) is ACCESS_DENIED, not EEXIST. Same meaning: busy.
             try:
                 age = time.time() - lock.stat().st_mtime
             except OSError:
-                continue  # vanished between open and stat: just retry
+                age = 0.0  # vanished or delete-pending: treat as live, retry
             if age > stale_after:
                 with contextlib.suppress(OSError):
                     lock.unlink()
@@ -145,8 +175,9 @@ def _locked(
             if time.monotonic() >= deadline:
                 raise MeshbookError(
                     "config_locked",
-                    f"{lock} is held by another process. If no meshbook client is "
-                    "running, delete that file and try again.",
+                    f"{lock} is held by another process (or the directory is not "
+                    "writable). If no meshbook client is running, delete that file and "
+                    "try again.",
                 ) from None
             time.sleep(_LOCK_POLL)
             continue
@@ -221,7 +252,7 @@ def save_config(
     except OSError as e:
         raise MeshbookError("config_write_failed", f"Cannot create {p.parent}: {e}") from e
     with _locked(p.parent, timeout=lock_timeout):
-        current = load_config(p)
+        current = _read_for_update(p)
         for key, value in updates.items():
             if value is None:
                 current.pop(key, None)
