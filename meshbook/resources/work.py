@@ -236,9 +236,27 @@ class Tasks(Namespace):
     ) -> ItemList[dict[str, Any]]:
         """Tasks assigned to you (own id via /api/me, cached per client).
 
-        ``open_only=True`` drops Done/Cancelled rows from the page (the
-        MCP's ``list_my_tasks``); ``.total`` stays the server's figure.
+        ``open_only=True`` leaves out Done/Cancelled tasks. The server's
+        ``status=`` filter matches ONE status, so:
+
+        * with a non-terminal ``status`` the server already filters, and the
+          page is returned as-is (paging intact); a terminal ``status``
+          (Done / Cancelled) with ``open_only=True`` is ``bad_argument``;
+        * without ``status`` the page is filtered client-side, so the result
+          can be shorter than ``limit`` while more pages exist. It then
+          carries ``total=None`` (the server's figure counted closed tasks
+          too; it is kept as ``meta["server_total"]``),
+          ``meta["server_rows"]`` (rows the server sent), and
+          :attr:`~meshbook.ItemList.has_more` / ``next_offset`` follow the
+          server's page, not the filtered length: page on with
+          ``offset=rows.next_offset``. (0.4.0 kept the server total and lost
+          the raw page length, so offset arithmetic after it was wrong.)
         """
+        if open_only and status in _TERMINAL:
+            raise MeshbookError(
+                "bad_argument",
+                f"status={status!r} contradicts open_only=True (it is a closed status).",
+            )
         rows = self.list(
             limit=limit,
             assignee_id=self._c._self_user_id(),
@@ -247,13 +265,16 @@ class Tasks(Namespace):
             sort=sort,
             mesh=mesh,
         )
-        if open_only:
+        if open_only and status is None:
             return ItemList(
                 (t for t in rows if t.get("status") not in _TERMINAL),
-                total=rows.total,
+                total=None,
                 limit=rows.limit,
                 offset=rows.offset,
-                meta=dict(rows.meta, open_only=True),
+                meta=dict(
+                    rows.meta, open_only=True, server_rows=len(rows), server_total=rows.total
+                ),
+                total_exact=False,
             )
         return rows
 

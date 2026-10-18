@@ -358,3 +358,40 @@ def test_total_exact_survives_the_typed_and_sorted_copies(client, monkeypatch):
     assert client.exports.list().total_exact is True
     r.add("GET", "/api/meshes", ok_list([{"id": MESH, "name": "m"}], total=1, limit=50, offset=0))
     assert client.meshes.list_mine().total_exact is True
+
+
+# ─── gap 7: tasks.list_mine(open_only=True) keeps paging correct ───────
+
+
+def test_open_only_reports_the_server_page_not_the_filtered_length(client, monkeypatch):
+    r = install(monkeypatch)
+    r.add("GET", "/api/me", ok({"user": {"id": U1}}))
+    page = [{"id": i, "status": "Done" if i % 2 else "NotStarted"} for i in range(4)]
+    r.add("GET", "/api/tasks", ok_list(page, total=10, limit=4, offset=0))
+    mine = client.tasks.list_mine(open_only=True, limit=4)
+    assert [t["id"] for t in mine] == [0, 2]
+    assert mine.total is None and mine.total_exact is False  # 10 counted closed tasks too
+    assert mine.meta["server_total"] == 10 and mine.meta["server_rows"] == 4
+    assert mine.next_offset == 4  # not 2: the server sent four rows
+    assert mine.has_more is True  # 4 of 10 read, though only 2 came back
+
+
+def test_open_only_last_page_is_not_has_more(client, monkeypatch):
+    r = install(monkeypatch)
+    r.add("GET", "/api/me", ok({"user": {"id": U1}}))
+    r.add("GET", "/api/tasks", ok_list([{"id": 9, "status": "Done"}], total=9, limit=4, offset=8))
+    mine = client.tasks.list_mine(open_only=True, limit=4, offset=8)
+    assert list(mine) == [] and mine.has_more is False and mine.next_offset == 9
+
+
+def test_open_only_with_a_status_lets_the_server_filter(client, monkeypatch):
+    r = install(monkeypatch)
+    r.add("GET", "/api/me", ok({"user": {"id": U1}}))
+    r.add("GET", "/api/tasks", ok_list([{"id": 1, "status": "Blocked"}], total=7, limit=1,
+                                       offset=0))
+    mine = client.tasks.list_mine(status="Blocked", open_only=True, limit=1)
+    assert r.query()["status"] == "Blocked"
+    assert mine.total == 7 and mine.total_exact is True
+    with pytest.raises(MeshbookError) as ei:
+        client.tasks.list_mine(status="Done", open_only=True)
+    assert ei.value.code == "bad_argument"

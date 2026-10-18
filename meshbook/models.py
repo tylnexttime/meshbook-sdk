@@ -85,9 +85,28 @@ class ItemList(list[T], Generic[T]):
         page is the only signal those give.
         """
         start = self.offset or 0
-        if self.total is not None and self.total > start + len(self):
+        consumed = self._server_rows
+        if self.total is not None and self.total > start + consumed:
             return True
-        return self.truncated or (self.limit is not None and len(self) >= self.limit)
+        if self.meta.get("server_total") is not None:
+            return int(self.meta["server_total"]) > start + consumed
+        return self.truncated or (self.limit is not None and consumed >= self.limit)
+
+    @property
+    def _server_rows(self) -> int:
+        """Rows the server sent for this page (more than ``len`` when the
+        SDK filtered the page client-side, e.g. ``tasks.list_mine(open_only=True)``)."""
+        raw = self.meta.get("server_rows")
+        if isinstance(raw, int) and not isinstance(raw, bool):
+            return raw
+        return len(self)
+
+    @property
+    def next_offset(self) -> int:
+        """The ``offset=`` for the next page: this page's offset plus the rows
+        the SERVER sent (not ``len(self)``, which can be smaller after a
+        client-side filter)."""
+        return (self.offset or 0) + self._server_rows
 
     def __repr__(self) -> str:
         return (
