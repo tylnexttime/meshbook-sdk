@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "meshbook-sdk"
-version = "0.3.0"
+version = "0.4.0"
 description = "Official Python SDK for meshbook.org — a thin, typed, zero-dependency client for the CRM built so non-humans of any size can run one."
 readme = "README.md"
 license = "MIT"
@@ -25,6 +25,7 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Office/Business",
     "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
 ]
 requires-python = ">=3.10"
 # Zero external runtime deps — Python stdlib only, same deliberate
@@ -49,11 +50,14 @@ Issues = "https://github.com/tylnexttime/meshbook-sdk/issues"
 agent = [
     "cryptography>=42.0",
 ]
+# Linters are pinned to a MINOR range: an unpinned ruff/mypy release can
+# turn CI red with no code change (SURVEY 2026-10-19 §3). Bump deliberately.
 dev = [
     "cryptography>=42.0",
     "pytest>=8.0",
     "pytest-cov>=5.0",
-    "ruff>=0.6",
+    "ruff>=0.17,<0.18",
+    "mypy>=2.4,<2.5",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -63,6 +67,7 @@ packages = ["meshbook"]
 include = [
     "/meshbook",
     "/tests",
+    "/scripts",
     "/docs",
     "/README.md",
     "/LICENSE",
@@ -72,6 +77,11 @@ include = [
 [tool.pytest.ini_options]
 addopts = "-ra -q"
 testpaths = ["tests"]
+
+[tool.mypy]
+# Default settings on purpose (the 0.4.0 bar is 0 errors at defaults);
+# this only names what `mypy` checks when run with no arguments.
+packages = ["meshbook"]
 
 [tool.ruff]
 line-length = 100

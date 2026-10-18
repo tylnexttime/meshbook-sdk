@@ -245,3 +245,20 @@ def test_non_json_200_is_a_typed_error(client, monkeypatch):
     with pytest.raises(MeshbookError) as ei:
         client.contacts.list()
     assert ei.value.code == "bad_response"
+
+
+def test_download_creates_missing_parent_directories(client, monkeypatch, tmp_path):
+    """0.3 wrote straight to out_path and raised FileNotFoundError when its
+    directory did not exist yet (the MCP's copy created it; now all do)."""
+    r = install(monkeypatch)
+    r.add("GET", "/api/chat-attachments/a1/download", b"DATA")
+    out = client.chat.download("a1", tmp_path / "new" / "deeper" / "f.bin")
+    assert out.read_bytes() == b"DATA"
+
+
+def test_package_ships_py_typed():
+    from pathlib import Path
+
+    import meshbook
+
+    assert (Path(meshbook.__file__).parent / "py.typed").exists()
