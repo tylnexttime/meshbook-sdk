@@ -10,6 +10,9 @@ used) can make.
 from __future__ import annotations
 
 import datetime as _dt
+import functools
+import re
+import zoneinfo
 from typing import Any
 
 from .errors import MeshbookError
@@ -103,3 +106,62 @@ def due_fields(value: Any) -> dict[str, Any]:
     if isinstance(value, str) and len(value.strip()) == 10:
         return {"dueDate": iso_date(value, "due")}
     return {"dueAt": iso_datetime(value, "due")}
+
+
+# ─── IANA zone names (recurrence tzid, list tz) ────────────────────────
+
+# Zone names are ASCII path segments: letters, digits, _ + - (Etc/GMT+10,
+# America/Port-au-Prince). No dots, so no "..", and no leading or trailing
+# slash: a name of this shape can never walk out of a tz directory.
+_IANA_SHAPE = re.compile(r"^[A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+-]+)*$")
+
+
+def _load_zone(name: str) -> Any:
+    """zoneinfo's lookup, behind a seam the tests can replace."""
+    return zoneinfo.ZoneInfo(name)
+
+
+@functools.lru_cache(maxsize=1)
+def _zone_db_available() -> bool:
+    """Does this Python have a tz database at all? Stock Windows Pythons
+    have none (no system zoneinfo, and ``tzdata`` is not installed), and
+    there every lookup fails, real zone or not."""
+    try:
+        zoneinfo.ZoneInfo("UTC")
+    except (KeyError, ValueError, OSError):
+        return bool(zoneinfo.available_timezones())
+    return True
+
+
+def iana_zone(value: Any, field: str = "tzid") -> str:
+    """An IANA zone name (or a ``zoneinfo.ZoneInfo``) → the name, checked.
+
+    ``bad_argument`` for anything that is not a zone name, and for an
+    unknown zone when this machine has a tz database to check against.
+    Without one (stock Windows Python with no ``tzdata``) only the shape is
+    checked and the server's ``invalid_timezone`` is the backstop:
+    refusing every zone there would refuse the real ones too.
+    ``pip install tzdata`` gives such a machine full checking.
+    """
+    key = getattr(value, "key", value)
+    if not isinstance(key, str) or not key.strip():
+        raise MeshbookError(
+            "bad_argument",
+            f"{field} must be an IANA time zone name such as 'Australia/Sydney', got {value!r}.",
+        )
+    name = key.strip()
+    if not _IANA_SHAPE.match(name):
+        raise MeshbookError(
+            "bad_argument",
+            f"{field}={name!r} is not an IANA time zone name (like 'Australia/Sydney').",
+        )
+    try:
+        _load_zone(name)
+    except (KeyError, ValueError, OSError):
+        if _zone_db_available():
+            raise MeshbookError(
+                "bad_argument",
+                f"Unknown time zone {field}={name!r}. Use an IANA name such as "
+                "'Australia/Sydney' or 'Europe/Warsaw'.",
+            ) from None
+    return name

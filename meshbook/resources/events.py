@@ -15,7 +15,7 @@ import datetime as _dt
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from .._times import aware, iso_date, iso_datetime
+from .._times import aware, iana_zone, iso_date, iso_datetime
 from ..client import _is_uuid
 from ..errors import MeshbookError
 from ..models import ItemList
@@ -35,6 +35,7 @@ def recurrence_rule(
     count: int | None = None,
     by_weekday: Iterable[str] | None = None,
     by_month_day: Iterable[int] | None = None,
+    tzid: Any = None,
 ) -> dict[str, Any]:
     """Build a RecurrenceIn body.
 
@@ -43,6 +44,11 @@ def recurrence_rule(
     ``count`` (occurrences, the first included) are mutually exclusive.
     ``by_weekday``: ``MO``…``SU`` (Monthly may carry an ordinal: ``3TH``,
     ``-1FR``); ``by_month_day``: 1..31 or -31..-1, Monthly only.
+    ``tzid``: the IANA zone the series repeats in (RFC 5545 TZID), so a
+    10:00 Sydney meeting stays at 10:00 across a DST change for every
+    reader. Checked with zoneinfo (``bad_argument`` for an unknown zone;
+    shape only on a machine with no tz database). Servers older than the
+    tzid change ignore it and repeat on the UTC wall clock, as before.
     """
     freq = (frequency or "").strip().lower()
     if freq == "fortnightly":
@@ -88,6 +94,8 @@ def recurrence_rule(
             if not isinstance(md, int) or isinstance(md, bool) or not (1 <= abs(md) <= 31):
                 raise MeshbookError("bad_argument", f"by_month_day values are 1..31 or -31..-1, got {md!r}.")
         body["byMonthDay"] = mdays
+    if tzid is not None:
+        body["tzid"] = iana_zone(tzid, "tzid")
     return body
 
 
@@ -97,16 +105,24 @@ def _is_ordinal(text: str) -> bool:
     return t.isdigit() and 1 <= int(t) <= 5
 
 
-def _recurrence_body(value: Any) -> Any:
-    """``recurrence=`` on create/update: None (clear), a dict, or a frequency string."""
+def _recurrence_body(value: Any, default_tzid: str | None = None) -> Any:
+    """``recurrence=`` on create/update: None (clear), a dict, or a frequency string.
+
+    *default_tzid* (create's ``tz=``) fills ``tzid`` when the rule names
+    none; a rule's own ``tzid`` (even ``None``) wins.
+    """
     if value is None:
         return None
     if isinstance(value, str):
-        return recurrence_rule(value)
+        return recurrence_rule(value, tzid=default_tzid)
     if isinstance(value, Mapping):
         v = dict(value)
+        tzid = v.get("tzid", default_tzid)
         if "intervalN" in v or "untilDate" in v or "countN" in v:
-            return v  # already wire-shaped
+            # Already wire-shaped (a copy, so the caller's dict is untouched).
+            if tzid is not None:
+                v["tzid"] = iana_zone(tzid, "tzid")
+            return v
         return recurrence_rule(
             str(v.get("frequency", "")),
             int(v.get("interval", 1)),
@@ -114,6 +130,7 @@ def _recurrence_body(value: Any) -> Any:
             count=v.get("count"),
             by_weekday=v.get("by_weekday"),
             by_month_day=v.get("by_month_day"),
+            tzid=tzid,
         )
     raise MeshbookError("bad_argument", "recurrence must be a dict, a frequency string, or None.")
 
@@ -190,6 +207,7 @@ class Events(Namespace):
         custom_fields: Any,
         attendees: Any,
         recurrence: Any,
+        default_tzid: str | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {}
         put(body, "title", title)
@@ -221,7 +239,7 @@ class Events(Namespace):
         if attendees is not UNSET:
             body["attendees"] = [self._attendee(a, mesh) for a in (attendees or [])]
         if recurrence is not UNSET:
-            body["recurrence"] = _recurrence_body(recurrence)
+            body["recurrence"] = _recurrence_body(recurrence, default_tzid)
         return body
 
     # ── the routes ────────────────────────────────────────────────────
@@ -261,7 +279,7 @@ class Events(Namespace):
             "linkedId": linked_id,
             "ownerId": self._user_id(owner, mesh=mesh) if owner else None,
             "expand": True if expand else None,
-            "tz": tz,
+            "tz": iana_zone(tz, "tz") if tz is not None else None,
         }
         return self._c._list("events.list", params=params, limit=limit, offset=offset, mesh=mesh)
 
@@ -287,6 +305,7 @@ class Events(Namespace):
         custom_fields: Mapping[str, Any] | None = None,
         attendees: Iterable[Any] | None = None,
         recurrence: Any = None,
+        tz: Any = None,
         dedupe: bool = False,
         fields: Mapping[str, Any] | None = None,
         mesh: str | None = None,
@@ -300,12 +319,18 @@ class Events(Namespace):
         * ``owner`` (default: you), attendees' ``user:`` refs: UUID,
           @username or display name; ``contact:`` refs: id, name or email.
         * ``recurrence``: ``recurrence_rule(...)``'s dict, a dict with
-          ``frequency``/``interval``/``until``/``count``…, or just
+          ``frequency``/``interval``/``until``/``count``/``tzid``…, or just
           ``"weekly"``.
+        * ``tz``: the IANA zone the event lives in (``"Australia/Sydney"``).
+          It becomes the recurrence's ``tzid`` unless the rule names its
+          own, so the series keeps its wall-clock time across DST. It does
+          NOT change how ``start``/``end`` are read: they still need an
+          offset. Without ``recurrence`` it is only validated.
         * ``dedupe=True`` refuses (``duplicate_event``) when an event with
           the same title and the same start instant already exists in the
           mesh — the guard ``mesh events create`` applies unless ``--force``.
         """
+        default_tzid = iana_zone(tz, "tz") if tz is not None else None
         body = self._event_body(
             mesh,
             title=title,
@@ -323,6 +348,7 @@ class Events(Namespace):
             custom_fields=dict(custom_fields) if custom_fields is not None else UNSET,
             attendees=list(attendees) if attendees is not None else UNSET,
             recurrence=recurrence if recurrence is not None else UNSET,
+            default_tzid=default_tzid,
         )
         merge_fields(body, fields)
         if dedupe:
@@ -364,7 +390,8 @@ class Events(Namespace):
         ``None`` clears a nullable field (description, location, meeting_url,
         owner, linked_type+linked_id together, color, custom_fields).
         ``attendees`` (when passed) REPLACES the attendee set — kept rows keep
-        their response. ``recurrence``: a rule = upsert, ``None`` = clear.
+        their response. ``recurrence``: a rule = upsert, ``None`` = clear; a
+        rule may carry ``tzid`` (see :func:`recurrence_rule`).
         """
         for name, value in (("title", title), ("start", start), ("end", end),
                             ("event_type", event_type), ("all_day", all_day)):
@@ -409,12 +436,15 @@ class Events(Namespace):
         count: int | None = None,
         by_weekday: Iterable[str] | None = None,
         by_month_day: Iterable[int] | None = None,
+        tzid: Any = None,
         mesh: str | None = None,
     ) -> dict[str, Any]:
         """PUT /api/calendar-events/{id}/recurrence — upsert the series rule
-        (see :func:`recurrence_rule` for the arguments)."""
+        (see :func:`recurrence_rule` for the arguments; ``tzid`` is the IANA
+        zone the series repeats in)."""
         body = recurrence_rule(
-            frequency, interval, until, count=count, by_weekday=by_weekday, by_month_day=by_month_day
+            frequency, interval, until, count=count, by_weekday=by_weekday,
+            by_month_day=by_month_day, tzid=tzid,
         )
         return as_dict(
             self._c._call("events.set_recurrence", path={"event_id": event_id}, body=body, mesh=mesh)

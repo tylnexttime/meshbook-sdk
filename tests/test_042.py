@@ -210,3 +210,153 @@ def test_the_proof_header_is_not_in_the_url(tmp_path, monkeypatch):
     _agent_client(tmp_path).agent.revoke()
     req = r.calls("DELETE")[0]
     assert urllib.parse.urlsplit(req.get_full_url()).query == ""
+
+
+# ─── 2. recurrence time zone (tzid) ────────────────────────────────────
+
+import datetime as dt  # noqa: E402
+
+from meshbook import recurrence_rule  # noqa: E402
+from tests._fakes import E1  # noqa: E402
+
+SYD = dt.timezone(dt.timedelta(hours=11))
+START = dt.datetime(2027, 3, 22, 10, 0, tzinfo=SYD)
+END = dt.datetime(2027, 3, 22, 11, 0, tzinfo=SYD)
+EV = f"/api/calendar-events/{E1}"
+KNOWN = {"Australia/Sydney", "Europe/Warsaw", "UTC", "America/Argentina/Buenos_Aires"}
+
+
+@pytest.fixture
+def zones(monkeypatch):
+    """A tz database with four zones, whatever this machine has (Windows
+    Pythons often have none: no tzdata package, no system zoneinfo)."""
+    import meshbook._times as t
+
+    def load(name):
+        if name not in KNOWN:
+            raise KeyError(name)
+        return name
+
+    monkeypatch.setattr(t, "_load_zone", load)
+    monkeypatch.setattr(t, "_zone_db_available", lambda: True)
+
+
+@pytest.fixture
+def no_zone_db(monkeypatch):
+    import meshbook._times as t
+
+    def load(name):
+        raise KeyError(name)
+
+    monkeypatch.setattr(t, "_load_zone", load)
+    monkeypatch.setattr(t, "_zone_db_available", lambda: False)
+
+
+@pytest.fixture
+def ev_client(tmp_path):
+    return MeshbookClient(token="mb_token_test", mesh=MESH, config_path=tmp_path / "none")
+
+
+def test_recurrence_rule_carries_tzid(zones):
+    assert recurrence_rule("weekly", tzid="Australia/Sydney") == {
+        "frequency": "Weekly", "intervalN": 1, "untilDate": None, "tzid": "Australia/Sydney"}
+    assert "tzid" not in recurrence_rule("weekly"), "no tzid unless asked: older wire unchanged"
+
+
+def test_set_recurrence_sends_tzid(ev_client, monkeypatch, zones):
+    r = install(monkeypatch)
+    r.add("PUT", EV + "/recurrence", ok({"id": "r1"}))
+    ev_client.events.set_recurrence(E1, "weekly", tzid="Australia/Sydney")
+    assert r.body()["tzid"] == "Australia/Sydney"
+
+
+def test_unknown_zone_is_bad_argument_before_the_wire(ev_client, monkeypatch, zones):
+    r = install(monkeypatch)
+    for call in (
+        lambda: ev_client.events.set_recurrence(E1, "weekly", tzid="Mars/Olympus"),
+        lambda: ev_client.events.create("x", START, END, recurrence="weekly", tz="Mars/Olympus"),
+        lambda: ev_client.events.create(
+            "x", START, END, recurrence={"frequency": "weekly", "tzid": "Australia/Sydny"}),
+        lambda: ev_client.events.update(E1, recurrence={"frequency": "weekly", "tzid": "Nope"}),
+        lambda: ev_client.events.list(tz="Mars/Olympus"),
+        lambda: recurrence_rule("weekly", tzid=""),
+        lambda: recurrence_rule("weekly", tzid=42),
+    ):
+        with pytest.raises(MeshbookError) as ei:
+            call()
+        assert ei.value.code == "bad_argument", ei.value
+    assert r.requests == []
+
+
+def test_create_tz_defaults_the_recurrence_tzid(ev_client, monkeypatch, zones):
+    """Alder's field note 1: `create --tz` stored nothing, so the series
+    slid an hour at the DST change. tz on create now rides on the rule."""
+    r = install(monkeypatch)
+    r.add("POST", "/api/calendar-events", ok({"id": E1}))
+    ev_client.events.create("Weekly", START, END, recurrence="weekly", tz="Australia/Sydney")
+    assert r.body()["recurrence"]["tzid"] == "Australia/Sydney"
+    ev_client.events.create("W2", START, END, tz="Australia/Sydney",
+                            recurrence={"frequency": "weekly", "interval": 2})
+    assert r.body()["recurrence"] == {"frequency": "Weekly", "intervalN": 2,
+                                      "untilDate": None, "tzid": "Australia/Sydney"}
+    # a wire-shaped rule gets the default too, without mutating the caller's dict
+    rule = {"frequency": "Weekly", "intervalN": 1, "untilDate": None}
+    ev_client.events.create("W3", START, END, tz="Australia/Sydney", recurrence=rule)
+    assert r.body()["recurrence"]["tzid"] == "Australia/Sydney" and "tzid" not in rule
+
+
+def test_an_explicit_rule_tzid_beats_create_tz(ev_client, monkeypatch, zones):
+    r = install(monkeypatch)
+    r.add("POST", "/api/calendar-events", ok({"id": E1}))
+    ev_client.events.create("x", START, END, tz="Australia/Sydney",
+                            recurrence={"frequency": "weekly", "tzid": "Europe/Warsaw"})
+    assert r.body()["recurrence"]["tzid"] == "Europe/Warsaw"
+    ev_client.events.create("y", START, END, tz="Australia/Sydney",
+                            recurrence=recurrence_rule("daily", tzid="UTC"))
+    assert r.body()["recurrence"]["tzid"] == "UTC"
+
+
+def test_create_tz_without_recurrence_sends_no_tz_field(ev_client, monkeypatch, zones):
+    r = install(monkeypatch)
+    r.add("POST", "/api/calendar-events", ok({"id": E1}))
+    ev_client.events.create("x", START, END, tz="Australia/Sydney")
+    assert "recurrence" not in r.body() and "tz" not in r.body() and "tzid" not in r.body()
+
+
+def test_update_recurrence_takes_tzid(ev_client, monkeypatch, zones):
+    r = install(monkeypatch)
+    r.add("PATCH", EV, ok({"id": E1}))
+    ev_client.events.update(E1, recurrence=recurrence_rule("weekly", tzid="Europe/Warsaw"))
+    assert r.body() == {"recurrence": {"frequency": "Weekly", "intervalN": 1,
+                                       "untilDate": None, "tzid": "Europe/Warsaw"}}
+
+
+def test_a_zoneinfo_object_is_accepted_by_its_key(ev_client, monkeypatch, zones):
+    class FakeZone:  # what zoneinfo.ZoneInfo exposes: .key
+        key = "Australia/Sydney"
+
+    assert recurrence_rule("weekly", tzid=FakeZone())["tzid"] == "Australia/Sydney"
+
+
+def test_without_a_tz_database_a_well_formed_name_passes_to_the_server(no_zone_db):
+    """No tzdata (stock Windows Python): the SDK cannot tell a real zone from
+    a typo, so it checks the shape only and leaves the rest to the server's
+    invalid_timezone. Refusing every zone there would break the bench in
+    Alder's field notes."""
+    assert recurrence_rule("weekly", tzid="Australia/Sydney")["tzid"] == "Australia/Sydney"
+    assert recurrence_rule("weekly", tzid=" Europe/Warsaw ")["tzid"] == "Europe/Warsaw"
+    for bad in ("../../etc/passwd", "Sydney/", "/UTC", "a b", "x\\y", "Mars.Olympus"):
+        with pytest.raises(MeshbookError) as ei:
+            recurrence_rule("weekly", tzid=bad)
+        assert ei.value.code == "bad_argument"
+
+
+def test_real_zoneinfo_when_this_machine_has_one():
+    """The un-faked path: runs wherever a tz database exists (CI on Linux)."""
+    import zoneinfo
+
+    if not zoneinfo.available_timezones():
+        pytest.skip("no tz database on this machine (install tzdata)")
+    assert recurrence_rule("weekly", tzid="Australia/Sydney")["tzid"] == "Australia/Sydney"
+    with pytest.raises(MeshbookError):
+        recurrence_rule("weekly", tzid="Mars/Olympus")
