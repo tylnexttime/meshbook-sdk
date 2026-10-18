@@ -29,32 +29,34 @@ def _due_key(task: Mapping[str, Any]) -> str:
     return str(task.get("dueAt") or task.get("dueDate") or "")
 
 
+#: The server's ``GET /api/tasks?sort=`` values (REPORT-SERVER-102).
+TASK_SORTS = ("due", "-due", "priority", "-priority", "created", "-created", "title", "-title")
+
+
 def _sort_tasks(rows: list[dict[str, Any]], sort: str) -> list[dict[str, Any]]:
-    """Client-side sort of one page (the server orders by status, sort order)."""
+    """Client-side mirror of the server's task sort, applied to the page.
+
+    The server sorts the whole set (since 2026-10-19); a server that
+    predates the ``sort`` param ignores it, so the page is sorted here too
+    with the same rules: ``priority`` = Urgent first, nulls last on every
+    key, ``-`` reverses.
+    """
     desc = sort.startswith("-")
-    key = sort.lstrip("-+").lower()
+    key = sort.lstrip("-")
     if key == "due":
         dated = [t for t in rows if _due_key(t)]
         undated = [t for t in rows if not _due_key(t)]
         dated.sort(key=_due_key, reverse=desc)
-        return dated + undated  # undated last either way
+        return dated + undated
     if key == "priority":
         rank = {p.lower(): i for i, p in enumerate(PRIORITIES)}
-        return sorted(
-            rows, key=lambda t: rank.get(str(t.get("priority") or "").lower(), -1), reverse=not desc
-        )  # "priority" = most urgent first; "-priority" = least urgent first
-    if key == "status":
-        srank = {s.lower(): i for i, s in enumerate(STATUSES)}
-        return sorted(
-            rows, key=lambda t: srank.get(str(t.get("status") or "").lower(), 99), reverse=desc
-        )
+        ranked = [t for t in rows if str(t.get("priority") or "").lower() in rank]
+        unranked = [t for t in rows if str(t.get("priority") or "").lower() not in rank]
+        ranked.sort(key=lambda t: rank[str(t.get("priority")).lower()], reverse=not desc)
+        return ranked + unranked
     if key == "title":
         return sorted(rows, key=lambda t: str(t.get("title") or "").casefold(), reverse=desc)
-    if key in ("created", "createdat"):
-        return sorted(rows, key=lambda t: str(t.get("createdAt") or ""), reverse=desc)
-    raise MeshbookError(
-        "bad_argument", f"sort must be one of due, priority, status, title, created (got {sort!r})."
-    )
+    return sorted(rows, key=lambda t: str(t.get("createdAt") or ""), reverse=desc)
 
 
 class Tags(Namespace):
@@ -188,20 +190,26 @@ class Tasks(Namespace):
           Cancelled.
         * ``project`` / ``assignee`` take a name or id (resolved);
           ``project_id`` / ``assignee_id`` are ids sent as-is.
-        * ``sort``: ``due`` (undated last), ``priority`` (most urgent
-          first), ``status``, ``title`` or ``created``; prefix ``-`` to
-          reverse. Applied to the page the server returned — the server
-          itself orders by status and board position.
+        * ``sort``: ``due`` (undated last), ``priority`` (Urgent first),
+          ``created`` or ``title``; prefix ``-`` to reverse. Sent to the
+          server (which sorts the whole set) and mirrored on the returned
+          page, so an older server that ignores ``sort`` still yields a
+          sorted page. Default: the server's board order.
         """
         if project is not None:
             project_id = str(self._c.projects.resolve(project, mesh=mesh)["id"])
         if assignee is not None:
             assignee_id = self._user_id(assignee, mesh=mesh)
+        if sort is not None and sort not in TASK_SORTS:
+            raise MeshbookError(
+                "bad_argument", f"sort must be one of {', '.join(TASK_SORTS)} (got {sort!r})."
+            )
         params = {
             "projectId": project_id,
             "assigneeId": assignee_id,
             "status": status,
             "search": search,
+            "sort": sort,
         }
         rows = self._c._list("tasks.list", params=params, limit=limit, offset=offset, mesh=mesh)
         if sort:
@@ -476,17 +484,31 @@ class Projects(Namespace):
             )
         return self.update(project_id, status=status, mesh=mesh)
 
+    def members(
+        self,
+        project_id: str,
+        *,
+        limit: int | None = None,
+        offset: int | None = None,
+        mesh: str | None = None,
+    ) -> ItemList[dict[str, Any]]:
+        """GET /api/projects/{id}/members — the project's EXPLICIT members
+        (``project.get()['members']`` also lists task leads/assignees)."""
+        return self._c._list(
+            "projects.members", path={"project_id": project_id}, limit=limit, offset=offset, mesh=mesh
+        )
+
     def add_member(
         self, project_id: str, user: str, role: str = "Member", *, mesh: str | None = None
     ) -> dict[str, Any]:
-        """Add a mesh member to a project (§102.6).
+        """POST /api/projects/{id}/members — add a mesh member (§102.6).
 
-        ``role``: Owner / Member / Watcher / Contributor / Reviewer.
-
-        PENDING SERVER ROUTE: ``POST /api/projects/{id}/members`` is built
-        to the 2026-10-19 contract; the server has the ``project_members``
-        table but, as of this release, no route — the call returns 404/405
-        until the server packet ships it.
+        ``user``: UUID, @username or display name. ``role``: Owner / Member
+        / Watcher / Contributor / Reviewer. Idempotent server-side: an
+        existing member comes back ``created: false`` (with the role updated
+        if it differs). A user who is not an accepted mesh member → 422
+        ``not_a_mesh_member``. New on the server 2026-10-19 (not on prod
+        until it is deployed).
         """
         if role not in PROJECT_ROLES:
             raise MeshbookError("bad_argument", f"role must be one of {', '.join(PROJECT_ROLES)}.")
@@ -497,6 +519,15 @@ class Projects(Namespace):
                 path={"project_id": project_id},
                 body={"userId": uid, "roleOnProject": role},
                 mesh=mesh,
+            )
+        )
+
+    def remove_member(self, project_id: str, user: str, *, mesh: str | None = None) -> dict[str, Any]:
+        """DELETE /api/projects/{id}/members/{userId} → ``{projectId, userId, removed: true}``."""
+        uid = self._user_id(user, mesh=mesh)
+        return as_dict(
+            self._c._call(
+                "projects.remove_member", path={"project_id": project_id, "user_id": uid}, mesh=mesh
             )
         )
 

@@ -68,7 +68,6 @@ def _ep(
 
 
 _CAL = "/api/calendar-events"
-_CAL_PENDING = "calendar contract 2026-10-19 (server packet; not in prod OpenAPI yet)"
 
 ENDPOINTS: dict[str, Endpoint] = {
     # ── infrastructure / identity ──
@@ -127,12 +126,9 @@ ENDPOINTS: dict[str, Endpoint] = {
     "projects.get": _ep("GET", "/api/projects/{project_id}"),
     "projects.update": _ep("PATCH", "/api/projects/{project_id}"),
     "projects.delete": _ep("DELETE", "/api/projects/{project_id}"),
-    "projects.add_member": _ep(
-        "POST",
-        "/api/projects/{project_id}/members",
-        pending="§102.6 project members: the server has the project_members table but no "
-        "route yet (server packet)",
-    ),
+    "projects.members": _ep("GET", "/api/projects/{project_id}/members"),
+    "projects.add_member": _ep("POST", "/api/projects/{project_id}/members"),
+    "projects.remove_member": _ep("DELETE", "/api/projects/{project_id}/members/{user_id}"),
     # ── tags (entity tags; used by tasks/contacts tags=) ──
     "tags.list": _ep("GET", "/api/tags"),
     "tags.entity_list": _ep("GET", "/api/entities/{entity_type}/{entity_id}/tags"),
@@ -174,20 +170,14 @@ ENDPOINTS: dict[str, Endpoint] = {
     "events.list": _ep("GET", _CAL),
     "events.create": _ep("POST", _CAL),
     "events.get": _ep("GET", _CAL + "/{event_id}"),
-    "events.update": _ep("PATCH", _CAL + "/{event_id}", pending=_CAL_PENDING),
+    "events.update": _ep("PATCH", _CAL + "/{event_id}"),
     "events.delete": _ep("DELETE", _CAL + "/{event_id}"),
-    "events.set_recurrence": _ep("PUT", _CAL + "/{event_id}/recurrence", pending=_CAL_PENDING),
-    "events.clear_recurrence": _ep(
-        "DELETE", _CAL + "/{event_id}/recurrence", pending=_CAL_PENDING
-    ),
-    "events.attendees": _ep("GET", _CAL + "/{event_id}/attendees", pending=_CAL_PENDING),
-    "events.add_attendee": _ep("POST", _CAL + "/{event_id}/attendees", pending=_CAL_PENDING),
-    "events.update_attendee": _ep(
-        "PATCH", _CAL + "/{event_id}/attendees/{attendee_id}", pending=_CAL_PENDING
-    ),
-    "events.remove_attendee": _ep(
-        "DELETE", _CAL + "/{event_id}/attendees/{attendee_id}", pending=_CAL_PENDING
-    ),
+    "events.set_recurrence": _ep("PUT", _CAL + "/{event_id}/recurrence"),
+    "events.clear_recurrence": _ep("DELETE", _CAL + "/{event_id}/recurrence"),
+    "events.attendees": _ep("GET", _CAL + "/{event_id}/attendees"),
+    "events.add_attendee": _ep("POST", _CAL + "/{event_id}/attendees"),
+    "events.update_attendee": _ep("PATCH", _CAL + "/{event_id}/attendees/{attendee_id}"),
+    "events.remove_attendee": _ep("DELETE", _CAL + "/{event_id}/attendees/{attendee_id}"),
 }
 
 

@@ -22,7 +22,7 @@ from .crm import Companies, Contacts, Leads, Pipelines
 from .events import EVENT_TYPES, FREQUENCIES, Events, recurrence_rule
 from .meshes import Meshes, Users
 from .misc import CustomFields, Exports, Files, Notifications, SavedViews
-from .work import PRIORITIES, PROJECT_ROLES, STATUSES, Projects, Tags, Tasks
+from .work import PRIORITIES, PROJECT_ROLES, STATUSES, TASK_SORTS, Projects, Tags, Tasks
 
 __all__ = [
     "EVENT_TYPES",
@@ -30,6 +30,7 @@ __all__ = [
     "PRIORITIES",
     "PROJECT_ROLES",
     "STATUSES",
+    "TASK_SORTS",
     "UNSET",
     "Channels",
     "Chat",

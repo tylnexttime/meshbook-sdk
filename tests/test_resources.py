@@ -134,13 +134,18 @@ def test_tasks_list_sort_and_filters(client, monkeypatch):
     r.add("GET", "/api/users", USERS)
     r.add("GET", "/api/tasks", ok_list(rows, total=3))
     by_due = client.tasks.list(sort="due", assignee="wren", search="x")
+    # Sent to the server (it sorts the whole set) AND mirrored on the page,
+    # so an older server that ignores ?sort= still yields a sorted page.
+    assert r.query() == {"limit": "50", "assigneeId": U1, "search": "x", "sort": "due"}
     assert [t["id"] for t in by_due] == [3, 1, 2]  # undated last
     assert by_due.total == 3
-    assert r.query() == {"limit": "50", "assigneeId": U1, "search": "x"}
-    assert [t["id"] for t in client.tasks.list(sort="priority")] == [2, 3, 1]
+    assert [t["id"] for t in client.tasks.list(sort="priority")] == [2, 3, 1]  # Urgent first
+    assert [t["id"] for t in client.tasks.list(sort="-priority")] == [1, 3, 2]
     assert [t["id"] for t in client.tasks.list(sort="-title")] == [3, 1, 2]
-    with pytest.raises(MeshbookError):
-        client.tasks.list(sort="vibes")
+    assert [t["id"] for t in client.tasks.list(sort="-due")] == [1, 3, 2]  # still undated last
+    for bad in ("vibes", "status"):
+        with pytest.raises(MeshbookError):
+            client.tasks.list(sort=bad)
 
 
 def test_tasks_list_mine_open_only(client, monkeypatch):
@@ -188,6 +193,16 @@ def test_projects_update_archive_add_member_delete(client, monkeypatch):
     with pytest.raises(MeshbookError):
         client.projects.add_member(P1, U1, role="Boss")
     assert client.projects.delete(P1)["deleted"] is True
+
+
+def test_project_members_list_and_remove(client, monkeypatch):
+    r = install(monkeypatch)
+    r.add("GET", f"/api/projects/{P1}/members", ok_list([{"userId": U1, "roleOnProject": "Owner"}]))
+    r.add("GET", "/api/users", USERS)
+    r.add("DELETE", f"/api/projects/{P1}/members/{U2}", ok({"projectId": P1, "userId": U2,
+                                                            "removed": True}))
+    assert client.projects.members(P1)[0]["roleOnProject"] == "Owner"
+    assert client.projects.remove_member(P1, "alder")["removed"] is True
 
 
 def test_projects_list_and_create(client, monkeypatch):
