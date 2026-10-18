@@ -78,6 +78,11 @@ def _isolated_env(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("MESHBOOK_CONFIG_DIR", str(tmp_path_factory.mktemp("meshbook-config")))
     for var in ("MESHBOOK_TOKEN", "MESHBOOK_BASE", "MESHBOOK_MESH"):
         monkeypatch.delenv(var, raising=False)
+    # The config re-read back-off (for older clients mid-rewrite) is real
+    # time; the suite needs the logic, not the wait.
+    import meshbook.config as cfgmod
+
+    monkeypatch.setattr(cfgmod, "READ_RETRY_DELAY", 0.0, raising=False)
 
 
 @pytest.fixture(autouse=True)

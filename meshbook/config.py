@@ -35,9 +35,14 @@ Writes are atomic (a temp file in the same directory, fsync, then
 ``os.replace``), serialised by an OS advisory lock on ``config.lock``
 beside the file (``fcntl.flock`` / ``msvcrt.locking``; released by the OS
 if a writer dies, short timeout, then ``config_locked``), and land with
-mode 600 on POSIX. The lock file itself is left in place. Windows has no equivalent of that mode: the file
-inherits the profile directory's ACL (DPAPI protection is noted as open
-work, not done).
+mode 600 on POSIX. The lock file itself is left in place. Windows has no
+equivalent of that mode: the file inherits the profile directory's ACL
+(DPAPI protection is noted as open work, not done).
+
+A file that cannot be read or parsed is re-read briefly (an older client
+may be mid-rewrite) and then reported, never overwritten: an update is
+refused with ``config_unreadable``, and :func:`quarantine_config` is the
+explicit repair.
 """
 from __future__ import annotations
 
@@ -95,51 +100,137 @@ def _resolve(path: str | os.PathLike[str] | None) -> Path:
     return Path(path).expanduser() if path is not None else config_path()
 
 
-def load_config(path: str | os.PathLike[str] | None = None) -> dict[str, Any]:
-    """Read the config file; ``{}`` when it is missing, unreadable or not a JSON object.
+#: A config that fails to read or parse is re-read this many times, this
+#: far apart, before it is judged broken: an older client (pre-0.4 CLI or
+#: MCP) truncates and rewrites the file non-atomically and without the
+#: lock, so a reader can catch it empty or half-written for an instant.
+READ_ATTEMPTS = 4
+READ_RETRY_DELAY = 0.1
+
+
+def _unreadable(p: Path, why: str) -> MeshbookError:
+    return MeshbookError(
+        "config_unreadable",
+        f"{p} exists but {why}. It was left untouched (it may still hold your token): "
+        "fix it by hand, or move it aside with meshbook.config.quarantine_config() "
+        "(`mesh login` then writes a fresh one).",
+    )
+
+
+def _read_parsed(p: Path) -> dict[str, Any]:
+    """The config as a dict, retrying transient failures; never guesses.
+
+    Missing -> ``{}``. Empty or whitespace after the retries -> ``{}``
+    (there is nothing in it to lose). Still unreadable after the retries ->
+    raises ``config_write_failed`` (an OS error) or ``config_unreadable``
+    (not utf-8, not JSON, or not a JSON object).
+    """
+    problem: MeshbookError | None = None
+    for attempt in range(READ_ATTEMPTS):
+        if attempt:
+            time.sleep(READ_RETRY_DELAY)
+        try:
+            text = p.read_text(encoding="utf-8-sig")
+        except FileNotFoundError:
+            return {}
+        except UnicodeDecodeError:
+            problem = _unreadable(p, "is not utf-8 text")
+            continue
+        except OSError as e:
+            problem = MeshbookError("config_write_failed", f"Cannot read {p}: {e}")
+            continue
+        if not text.strip():
+            problem = None  # empty: maybe mid-rewrite, so look again
+            continue
+        try:
+            loaded = json.loads(text)
+        except json.JSONDecodeError:
+            problem = _unreadable(p, "is not valid JSON")
+            continue
+        if isinstance(loaded, dict):
+            return loaded
+        problem = _unreadable(p, "is not a JSON object")
+    if problem is None:
+        return {}
+    raise problem
+
+
+def load_config(
+    path: str | os.PathLike[str] | None = None, *, strict: bool = False
+) -> dict[str, Any]:
+    """Read the config file.
 
     Read as utf-8 (``utf-8-sig``, so a BOM left by a Windows editor is
     tolerated). Files written by older clients in the locale encoding are
-    plain ASCII — ``json.dumps`` escapes everything else — so they read
-    identically.
+    plain ASCII (``json.dumps`` escapes everything else), so they read
+    identically. A failed read or parse is retried briefly first (an older
+    client may be mid-rewrite).
+
+    Missing -> ``{}``. A file that exists but cannot be read or parsed ->
+    ``{}`` by default (0.4.0 behaviour), or with ``strict=True`` a
+    ``config_unreadable`` / ``config_write_failed`` error, so a caller can
+    say "your config is broken" instead of "you have no token" (the client
+    does this).
     """
     p = _resolve(path)
     try:
-        text = p.read_text(encoding="utf-8-sig")
-    except (OSError, UnicodeDecodeError):
+        return _read_parsed(p)
+    except MeshbookError:
+        if strict:
+            raise
         return {}
-    try:
-        loaded = json.loads(text)
-    except json.JSONDecodeError:
-        return {}
-    return loaded if isinstance(loaded, dict) else {}
 
 
 def _read_for_update(p: Path) -> dict[str, Any]:
     """The current file, for a read-modify-write under the lock.
 
-    Stricter than :func:`load_config`, because an empty answer here would
-    be WRITTEN BACK: a transient read error must not turn into a config
-    holding only the update (the token gone). Missing → ``{}``; unreadable
-    → ``config_write_failed``; not a JSON object → the bad file is kept as
-    ``config.bad`` and replaced (so a broken config never blocks
-    ``mesh login`` from repairing it).
+    Never guesses, because whatever comes back here is WRITTEN BACK: a
+    config that cannot be read or parsed (after the retries) raises and
+    nothing is written, so an update can never drop the token (critique
+    C-04; 0.4.0 renamed it to config.bad and wrote only the update).
+    Repair is explicit: :func:`quarantine_config`.
     """
-    try:
-        text = p.read_text(encoding="utf-8-sig")
-    except FileNotFoundError:
-        return {}
-    except (OSError, UnicodeDecodeError) as e:
-        raise MeshbookError("config_write_failed", f"Cannot read {p} to update it: {e}") from e
-    try:
-        loaded = json.loads(text)
-    except json.JSONDecodeError:
-        loaded = None
-    if isinstance(loaded, dict):
-        return loaded
-    with contextlib.suppress(OSError):
-        os.replace(p, p.with_name(p.name + ".bad"))
-    return {}
+    return _read_parsed(p)
+
+
+def quarantine_config(path: str | os.PathLike[str] | None = None) -> Path | None:
+    """Move a config that cannot be parsed aside, so a fresh one can be written.
+
+    The explicit repair for ``config_unreadable`` (``mesh login`` can call
+    it when the user agrees). Under the lock, re-checks that the file is
+    still unreadable (an older client may have finished its rewrite), then
+    renames it to ``config.bad.<UTC timestamp>`` (``.1``, ``.2`` ... if
+    that exists), never overwriting an earlier one, since it may hold the
+    only copy of a token. Returns the new path, or None when there was
+    nothing to quarantine (missing, or readable after all).
+    """
+    p = _resolve(path)
+    if not p.parent.exists():
+        return None
+    with _locked(p.parent):
+        try:
+            _read_parsed(p)
+            return None
+        except MeshbookError as e:
+            if e.code != "config_unreadable":
+                raise
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        n = 0
+        while True:
+            target = p.with_name(f"{p.name}.bad.{stamp}" + (f".{n}" if n else ""))
+            try:
+                os.link(p, target)  # fails if target exists: no-clobber
+            except FileExistsError:
+                n += 1
+                continue
+            except OSError:  # no hard links on this filesystem
+                if target.exists():
+                    n += 1
+                    continue
+                os.replace(p, target)
+                return target
+            p.unlink()
+            return target
 
 
 if sys.platform == "win32":
@@ -311,7 +402,10 @@ def save_config(
 
     Returns the config as written. Raises :class:`MeshbookError`
     (``config_locked``) if another writer holds the lock past the timeout,
-    or (``config_write_failed``) if the directory or file cannot be written.
+    (``config_write_failed``) if the directory or file cannot be read or
+    written, or (``config_unreadable``) if the existing file is not a JSON
+    object even after a brief re-read. Nothing is written then; see
+    :func:`quarantine_config`.
     """
     p = _resolve(path)
     try:
@@ -349,6 +443,11 @@ def reset_config(
     if not p.parent.exists():
         return False
     with _locked(p.parent, timeout=lock_timeout):
+        # Quarantined copies and orphaned temp files may hold the token too:
+        # logging out removes them (0.4.0 left config.bad behind).
+        for leftover in [*p.parent.glob(p.name + ".bad*"), *p.parent.glob(".config.*.tmp")]:
+            with contextlib.suppress(OSError):
+                leftover.unlink()
         try:
             p.unlink()
         except FileNotFoundError:
@@ -364,10 +463,13 @@ __all__ = [
     "LOCK_FILENAME",
     "LOCK_STALE_AFTER",
     "LOCK_TIMEOUT",
+    "READ_ATTEMPTS",
+    "READ_RETRY_DELAY",
     "SCHEMA_VERSION",
     "config_dir",
     "config_path",
     "load_config",
+    "quarantine_config",
     "reset_config",
     "save_config",
 ]

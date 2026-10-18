@@ -636,7 +636,19 @@ class MeshbookClient:
         self.config_path: Path = (
             Path(config_path).expanduser() if config_path else _config.config_path()
         )
-        cfg = _config.load_config(self.config_path)
+        #: Why the config file could not be used, when it exists but is
+        #: broken (a MeshbookError, code config_unreadable or
+        #: config_write_failed); None otherwise. A call that then has no
+        #: token raises THIS instead of "no API token" (critique C-40):
+        #: the token may well be in the broken file, and "run mesh login"
+        #: was the advice that overwrote it.
+        self.config_error: MeshbookError | None = None
+        try:
+            cfg = _config.load_config(self.config_path, strict=True)
+        except MeshbookError as e:
+            cfg = {}
+            self.config_error = e
+            log.warning("meshbook config ignored: %s", e.message)
         self.config: dict[str, Any] = cfg
 
         env_token = os.environ.get("MESHBOOK_TOKEN") or None
@@ -854,6 +866,10 @@ class MeshbookClient:
                     return self.token, False
                 raise
         if not self.token:
+            if self.config_error is not None:
+                raise MeshbookError(
+                    self.config_error.code, self.config_error.message, self.config_error.status
+                )
             raise MeshbookError(
                 "not_authenticated",
                 "No API token. Pass token=, set MESHBOOK_TOKEN, or run `mesh login`.",

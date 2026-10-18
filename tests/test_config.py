@@ -284,11 +284,20 @@ def test_an_unreadable_config_is_never_overwritten(tmp_path, monkeypatch):
     assert p.read_bytes() == before
 
 
-def test_a_corrupt_config_is_kept_aside_and_replaced(tmp_path):
-    """A broken file must not block `mesh login` from repairing it, and must
-    not be destroyed either."""
+def test_a_corrupt_config_is_never_written_over_and_repair_is_explicit(tmp_path):
+    """0.4.1 (critique C-04): 0.4.0 renamed a broken file to config.bad and
+    wrote back ONLY the update, so a config caught mid-rewrite by an older
+    client lost its token. Now the update is refused and the file is left
+    byte-identical; quarantine_config() is the explicit repair."""
     p = tmp_path / "config"
     p.write_text("{half a json", encoding="utf-8")
+    with pytest.raises(MeshbookError) as ei:
+        cfgmod.save_config({"token": "t"}, p)
+    assert ei.value.code == "config_unreadable" and str(p) in ei.value.message
+    assert p.read_text(encoding="utf-8") == "{half a json"
+    assert not list(tmp_path.glob("config.bad*"))
+    moved = cfgmod.quarantine_config(p)
+    assert moved is not None and moved.name.startswith("config.bad.")
+    assert moved.read_text(encoding="utf-8") == "{half a json" and not p.exists()
     cfgmod.save_config({"token": "t"}, p)
     assert cfgmod.load_config(p)["token"] == "t"
-    assert (tmp_path / "config.bad").read_text(encoding="utf-8") == "{half a json"
