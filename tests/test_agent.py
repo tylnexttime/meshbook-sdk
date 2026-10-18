@@ -903,3 +903,136 @@ def test_agent_token_mint_read_failure_is_typed(agent_client, monkeypatch, tmp_p
     with pytest.raises(MeshbookError) as ei:
         agent_client.agent.token()
     assert ei.value.code == "network_error"
+
+
+# ─── critique C-14: the new key is on disk before the server switches ──
+
+
+def _kid_of(assertion: str) -> str:
+    head = assertion.split(".")[0]
+    return json.loads(base64.urlsafe_b64decode(head + "=" * (-len(head) % 4)))["kid"]
+
+
+class _Seat:
+    """A scripted server + Authentik: remembers the key it switched to and
+    mints only for that kid. ``enroll_fails`` decides how the switching
+    call answers AFTER the switch happened (or, for a 4xx, instead of it)."""
+
+    def __init__(self, monkeypatch, live_kid, enroll_fails=None):
+        self.accepted = live_kid
+        self.enroll_fails = enroll_fails
+        monkeypatch.setattr(mc, "_urlopen", self)
+
+    def __call__(self, req, timeout):
+        url = req.get_full_url()
+        if url == TOKEN_ENDPOINT:
+            kid = _kid_of(_form(req)["client_assertion"])
+            if kid != self.accepted:
+                body = json.dumps({"error": "invalid_client", "error_description": "bad key"})
+                raise urllib.error.HTTPError(url, 400, "Bad", hdrs=None,
+                                             fp=io.BytesIO(body.encode()))
+            return _minted("at-" + kid[-6:])
+        new_kid = json.loads(req.data.decode())["publicKey"]["kid"]
+        fail = self.enroll_fails
+        if fail is not None and fail[0] == 403:  # refused: nothing switched
+            raise urllib.error.HTTPError(url, 403, "No", hdrs=None,
+                                         fp=io.BytesIO(b'{"error": {"code": "humans_use_oauth"}}'))
+        self.accepted = new_kid  # the switch happens before the answer
+        if fail is None:
+            return FakeResponse({"ok": True, "data": dict(REGISTER_BUNDLE, kid=new_kid)})
+        if fail[0] == "reset":
+            class Lost:
+                headers: dict = {}
+
+                def read(self):
+                    raise ConnectionResetError("response lost")
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+            return Lost()
+        raise urllib.error.HTTPError(url, fail[0], "err", hdrs=None, fp=io.BytesIO(b"{}"))
+
+
+def test_enroll_500_after_the_switch_keeps_the_key_and_token_recovers(agent_client,
+                                                                      monkeypatch, tmp_path):
+    _seed_identity(tmp_path)
+    old_pem = (tmp_path / "agent-key.pem").read_bytes()
+    seat = _Seat(monkeypatch, ECHO_KID, enroll_fails=(500,))
+    with pytest.raises(MeshbookError) as ei:
+        agent_client.agent.enroll(force=True)
+    assert ei.value.status == 500 and "recover_pending" in ei.value.message
+    pending = agent_client.agent.pending_key_path
+    assert pending.exists() and agent_client.agent.has_pending()
+    assert (tmp_path / "agent-key.pem").read_bytes() == old_pem  # live key untouched
+    new_pem = pending.read_bytes()
+    # The old key is dead server-side; token() finds the pending one and promotes it.
+    assert agent_client.agent.token() == "at-" + seat.accepted[-6:]
+    assert (tmp_path / "agent-key.pem").read_bytes() == new_pem
+    assert (tmp_path / "agent-key.pem.bak").read_bytes() == old_pem
+    assert agent_client.agent.local_meta()["kid"] == seat.accepted
+    assert not agent_client.agent.has_pending()
+    assert not agent_client.agent.pending_meta_path.exists()
+
+
+def test_register_with_a_lost_response_is_recoverable(agent_client, monkeypatch, tmp_path):
+    seat = _Seat(monkeypatch, None, enroll_fails=("reset",))
+    with pytest.raises(MeshbookError) as ei:
+        agent_client.agent.register("Wanderer")
+    assert ei.value.code == "network_error"
+    assert agent_client.agent.has_pending() and not (tmp_path / "agent-key.pem").exists()
+    # A first-ever register has no local bundle to copy endpoints from…
+    with pytest.raises(MeshbookError) as ei:
+        agent_client.agent.recover_pending()
+    assert ei.value.code == "no_agent_key"
+    # …so the caller supplies them; the pending key mints and is promoted.
+    assert agent_client.agent.recover_pending(bundle=BUNDLE) is True
+    meta = agent_client.agent.local_meta()
+    assert meta["kid"] == seat.accepted and meta["username"] == "wanderer"
+    assert meta["tokenEndpoint"] == TOKEN_ENDPOINT and meta["audience"] == MINT_AUD
+    assert agent_client.agent.token().startswith("at-")
+
+
+def test_a_definite_refusal_discards_the_pending_key(agent_client, monkeypatch, tmp_path):
+    _seed_identity(tmp_path)
+    _Seat(monkeypatch, ECHO_KID, enroll_fails=(403,))
+    with pytest.raises(MeshbookError) as ei:
+        agent_client.agent.enroll(force=True)
+    assert ei.value.status == 403
+    assert not agent_client.agent.has_pending()
+
+
+def test_recover_pending_returns_false_when_the_switch_never_happened(agent_client,
+                                                                      monkeypatch, tmp_path):
+    _seed_identity(tmp_path)
+    seat = _Seat(monkeypatch, ECHO_KID, enroll_fails=(502,))
+    with pytest.raises(MeshbookError):
+        agent_client.agent.enroll(force=True)
+    seat.accepted = ECHO_KID  # pretend the server rolled back
+    assert agent_client.agent.recover_pending() is False
+    assert agent_client.agent.has_pending()
+    assert agent_client.agent.token() == "at-" + ECHO_KID[-6:]  # old key still works
+
+
+def test_a_pending_key_blocks_a_new_enroll_until_settled(agent_client, monkeypatch, tmp_path):
+    _seed_identity(tmp_path)
+    _Seat(monkeypatch, ECHO_KID, enroll_fails=(500,))
+    with pytest.raises(MeshbookError):
+        agent_client.agent.enroll(force=True)
+    with pytest.raises(MeshbookError) as ei:
+        agent_client.agent.enroll(force=True)
+    assert ei.value.code == "pending_key"
+    assert agent_client.agent.discard_pending() is True
+    _Seat(monkeypatch, ECHO_KID)
+    agent_client.agent.enroll(force=True)
+    assert not agent_client.agent.has_pending()
+
+
+def test_a_successful_enroll_leaves_no_pending_file(agent_client, monkeypatch, tmp_path):
+    _Seat(monkeypatch, None)
+    agent_client.agent.enroll()
+    assert not agent_client.agent.has_pending()
+    assert not agent_client.agent.pending_meta_path.exists()

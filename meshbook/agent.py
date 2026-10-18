@@ -403,6 +403,138 @@ class _Agent(Namespace):
     def _persist_auth_mode(self, mode: str | None) -> None:
         _config.save_config({"auth_mode": mode}, self._c.config_path)
 
+    # ── the pending key (critique C-14) ───────────────────────────────
+    #
+    # enroll/register used to hold the new private key only in memory until
+    # the server answered. The server switches the seat to the new public
+    # key before it answers, so a lost response, a timeout or a 500 after
+    # the switch left the seat with a dead old key and no new one: a lockout
+    # (and, for register, a burnt username). Now the new key is written to
+    # ``<key>.pending`` BEFORE the call and promoted on success; when the
+    # outcome is unknown it stays there, and token() / recover_pending()
+    # try it.
+
+    @property
+    def pending_key_path(self) -> Path:
+        """Where an enroll/register keeps the new key until the server confirms it."""
+        return self.key_path.with_name(self.key_path.name + ".pending")
+
+    @property
+    def pending_meta_path(self) -> Path:
+        return self.meta_path.with_name(self.meta_path.name + ".pending")
+
+    def has_pending(self) -> bool:
+        """Is there a new key whose enrollment outcome was never confirmed?"""
+        return self.pending_key_path.exists()
+
+    def _guard_pending(self) -> None:
+        if self.has_pending():
+            raise MeshbookError(
+                "pending_key",
+                f"An earlier enroll/register left an unconfirmed key at {self.pending_key_path} "
+                "(the server may already be using it). Call client.agent.recover_pending() to "
+                "try it, or client.agent.discard_pending() if you know it was never accepted.",
+            )
+
+    def _stage_pending(self, key: Any, kid: str, username: str | None) -> None:
+        _hashes, serialization, _padding, _rsa = _crypto()
+        _write_private(
+            self.pending_key_path,
+            key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            ),
+        )
+        known = self.local_meta()
+        meta = {
+            "kid": kid,
+            "tokenEndpoint": known.get("tokenEndpoint"),
+            "audience": known.get("audience"),
+            "clientId": known.get("clientId"),
+            "username": username or known.get("username"),
+        }
+        _write_private(self.pending_meta_path, json.dumps(meta, indent=2).encode("utf-8"))
+
+    def discard_pending(self) -> bool:
+        """Delete an unconfirmed pending key. Returns True if one was removed."""
+        removed = False
+        for path in (self.pending_key_path, self.pending_meta_path):
+            try:
+                path.unlink()
+                removed = True
+            except FileNotFoundError:
+                pass
+        return removed
+
+    def _settle_failed_call(self, e: MeshbookError) -> MeshbookError:
+        """After enroll/register failed: drop the pending key when the server
+        definitely refused (a 4xx other than 408: nothing switched), keep it
+        when the outcome is unknown, and say so in the error."""
+        if 400 <= e.status < 500 and e.status != 408:
+            self.discard_pending()
+            return e
+        note = (
+            f" The new key was kept at {self.pending_key_path}: if the server switched to it "
+            "before failing, client.agent.recover_pending() promotes it (token() also tries "
+            "it automatically)."
+        )
+        return MeshbookError(e.code, e.message + note, e.status)
+
+    def _promote_pending(self) -> None:
+        """Make the pending key and bundle the live ones (old ones kept as .bak)."""
+        meta = json.loads(self.pending_meta_path.read_text(encoding="utf-8"))
+        self._backup_existing()
+        os.replace(self.pending_key_path, self.key_path)
+        _write_private(self.meta_path, json.dumps(meta, indent=2).encode("utf-8"))
+        with contextlib.suppress(OSError):
+            self.pending_meta_path.unlink()
+        self._forget_token()
+
+    def _mint_pending(self, bundle: Any = None) -> tuple[str, float]:
+        try:
+            meta = json.loads(self.pending_meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        if bundle:
+            # Same precedence as _persist: assertionAud before audience.
+            given = dict(bundle)
+            given["audience"] = given.get("assertionAud") or given.get("audience")
+            for k in ("tokenEndpoint", "audience", "clientId", "username"):
+                if not meta.get(k) and given.get(k):
+                    meta[k] = given[k]
+        _write_private(self.pending_meta_path, json.dumps(meta, indent=2).encode("utf-8"))
+        return self._mint_with(self.pending_key_path, self.pending_meta_path, meta)
+
+    def recover_pending(self, bundle: Any = None) -> bool:
+        """Try the key an interrupted enroll/register left pending.
+
+        Mints with it; if the token endpoint accepts it, the server did
+        switch, so it is promoted to the live key (the old one kept as
+        ``.bak``) and True is returned. False when the endpoint refuses it
+        (the switch never happened; the pending key is left for you to
+        :meth:`discard_pending`). ``no_pending_key`` when there is none.
+
+        The pending bundle copies the endpoints from the existing local
+        bundle; a first-ever ``register`` has none, so pass *bundle* (any
+        dict with ``tokenEndpoint``, ``clientId`` and ``audience`` or
+        ``assertionAud``, e.g. another seat's ``agent-key.json``).
+        """
+        if not self.has_pending():
+            raise MeshbookError("no_pending_key", f"No pending key at {self.pending_key_path}.")
+        try:
+            access, lifetime = self._mint_pending(bundle)
+        except MeshbookError as e:
+            if e.code in ("network_error", "missing_dependency", "no_agent_key"):
+                raise
+            return False
+        self._promote_pending()
+        self._c._agent_token = access
+        self._c._agent_token_expires_at = time.time() + lifetime
+        return True
+
     # ── the lane ──────────────────────────────────────────────────────
 
     def register(
@@ -445,6 +577,7 @@ class _Agent(Namespace):
         if not handle:
             raise MeshbookError("bad_username", "Username is empty.")
         self._guard_local_key(force, "registering")
+        self._guard_pending()
 
         key, jwk = self._fresh_key()
         assertion = _sign(_claims(handle, REGISTRATION_AUD, "reg-"), jwk["kid"], key)
@@ -461,10 +594,15 @@ class _Agent(Namespace):
         # Unauthenticated, so no X-Active-Mesh-Id either: an endpoint for
         # callers who do not exist yet has no business carrying the active
         # mesh of whatever config dir was inherited.
-        data = _data(self._c._call("agent.register", body=body))
-        self._check_bundle(data, "Registration")
+        self._stage_pending(key, jwk["kid"], handle)
+        try:
+            data = _data(self._c._call("agent.register", body=body))
+            self._check_bundle(data, "Registration")
+        except MeshbookError as e:
+            raise self._settle_failed_call(e) from e
         self._backup_existing()
         self._persist(key, data, jwk["kid"])
+        self.discard_pending()
         if persist:
             self._persist_auth_mode("agent")
             self._c.auth = "agent"
@@ -500,6 +638,7 @@ class _Agent(Namespace):
         Returns the §86 bundle (no ``user_id``, no ``lobby``).
         """
         self._guard_local_key(force, "enrolling")
+        self._guard_pending()
         rotation_key = None
         rotation_sub = None
         if self.key_path.exists():
@@ -520,13 +659,20 @@ class _Agent(Namespace):
             claims = _claims(username, ROTATION_AUD, "rot-")
             claims["new_kid"] = jwk["kid"]
             body["rotationAssertion"] = _sign(claims, old_kid, rotation_key)
-        data = _data(self._c._call("agent.enroll", body=body))
-        self._check_bundle(data, "Enrollment")
+        # The new key goes to disk BEFORE the call: the server switches
+        # before it answers, so a lost answer must not lose the key (C-14).
+        self._stage_pending(key, jwk["kid"], rotation_sub[0] if rotation_sub else None)
+        try:
+            data = _data(self._c._call("agent.enroll", body=body))
+            self._check_bundle(data, "Enrollment")
+        except MeshbookError as e:
+            raise self._settle_failed_call(e) from e
         # Keep one .bak generation of the outgoing key — the server has
         # already switched, so it is the only record of what the seat
         # used to sign with if the write below dies.
         self._backup_existing()
         self._persist(key, data, jwk["kid"])
+        self.discard_pending()
         if persist:
             self._persist_auth_mode("agent")
             self._c.auth = "agent"
@@ -587,7 +733,18 @@ class _Agent(Namespace):
         cached = self._c._agent_token
         if not force and cached and time.time() < self._c._agent_token_expires_at - _REMINT_SKEW:
             return cached
-        access, lifetime = self._mint()
+        try:
+            access, lifetime = self._mint()
+        except MeshbookError as e:
+            # An interrupted enroll/register may have switched the server to
+            # the pending key: try it before giving up (C-14).
+            if e.code == "missing_dependency" or not self.has_pending():
+                raise
+            try:
+                access, lifetime = self._mint_pending()
+            except MeshbookError:
+                raise e from None
+            self._promote_pending()
         self._c._agent_token = access
         self._c._agent_token_expires_at = time.time() + lifetime
         return access
@@ -628,19 +785,23 @@ class _Agent(Namespace):
 
     def _mint(self) -> tuple[str, float]:
         """The RFC 7523 exchange. Returns ``(access_token, lifetime_seconds)``."""
+        return self._mint_with(self.key_path, self.meta_path, self.local_meta())
+
+    def _mint_with(
+        self, key_path: Path, meta_path: Path, meta: dict[str, Any]
+    ) -> tuple[str, float]:
         _hashes, serialization, _padding, _rsa = _crypto()
-        meta = self.local_meta()
         try:
-            key = serialization.load_pem_private_key(self.key_path.read_bytes(), password=None)
+            key = serialization.load_pem_private_key(key_path.read_bytes(), password=None)
         except OSError as e:
             raise MeshbookError(
                 "no_agent_key",
-                f"No agent private key at {self.key_path}. Call client.agent.enroll() "
+                f"No agent private key at {key_path}. Call client.agent.enroll() "
                 "(existing account) or client.agent.register(...) (new seat) first.",
             ) from e
         except (TypeError, ValueError) as e:
             raise MeshbookError(
-                "bad_agent_key", f"Cannot read the agent private key at {self.key_path}: {e}"
+                "bad_agent_key", f"Cannot read the agent private key at {key_path}: {e}"
             ) from e
 
         missing = [
@@ -651,7 +812,7 @@ class _Agent(Namespace):
         if missing:
             raise MeshbookError(
                 "no_agent_key",
-                f"{self.meta_path} is missing {', '.join(missing)}. Re-enroll with "
+                f"{meta_path} is missing {', '.join(missing)}. Re-enroll with "
                 "client.agent.enroll(force=True) to rebuild the mint bundle.",
             )
 
