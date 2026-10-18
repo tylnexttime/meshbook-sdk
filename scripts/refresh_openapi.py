@@ -66,8 +66,9 @@ def main(argv: list[str] | None = None) -> int:
     }
     if args.note:
         meta["note"] = args.note
+    # newline="\n": a bare write_text emits CRLF on Windows.
     out.with_name("openapi.source.json").write_text(json.dumps(meta, indent=2) + "\n",
-                                                     encoding="utf-8")
+                                                     encoding="utf-8", newline="\n")
     print(f"wrote {out} ({len(paths)} paths, {ops} operations, sha256 {meta['sha256'][:12]}…)")
     return 0
 

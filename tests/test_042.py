@@ -542,3 +542,24 @@ def test_server_too_old_is_documented():
     from meshbook.errors import HINT_MEANINGS
 
     assert "server_too_old" in HINT_MEANINGS
+
+
+def test_refresh_openapi_writes_lf_provenance(tmp_path):
+    """scripts/refresh_openapi.py wrote openapi.source.json through
+    write_text, which turns LF into CRLF on Windows (git warned on the
+    0.4.2 re-pin). The spec itself is copied byte for byte."""
+    import importlib.util
+    from pathlib import Path
+
+    script = Path(__file__).parent.parent / "scripts" / "refresh_openapi.py"
+    spec = importlib.util.spec_from_file_location("refresh_openapi_042", script)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    src = tmp_path / "in.json"
+    src.write_bytes(b'{"openapi": "3.1.0", "paths": {"/api/x": {"get": {}}}}')
+    out = tmp_path / "out" / "openapi.json"
+    out.parent.mkdir()
+    assert mod.main(["--from", str(src), "--out", str(out), "--note", "t"]) == 0
+    assert out.read_bytes() == src.read_bytes()
+    assert b"\r\n" not in (out.parent / "openapi.source.json").read_bytes()
