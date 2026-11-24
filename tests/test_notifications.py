@@ -979,3 +979,10 @@ def test_is_read_prefers_is_read_over_read_at():
     assert nmod._is_read({"readAt": "2026-05-01T00:00:00+00:00"}) is True  # older shape only
     assert nmod._is_read({"readAt": None}) is False
     assert nmod._is_read({}) is None
+
+
+def test_the_public_read_state_helper_follows_the_same_rule():
+    from meshbook.resources import notification_is_read
+
+    stale = {"isRead": False, "readAt": "2026-05-01T00:00:00+00:00"}
+    assert notification_is_read(stale) is False and notification_is_read({"readAt": None}) is False

@@ -44,6 +44,9 @@ methods must be rolled back with it.
   the production server and the s106 server fix as two modes, scoped and
   read-only tokens, fault injection), shipped for meshbook-cli and
   meshbook-mcp tests.
+- `meshbook.resources.notification_is_read(row)`: the read-state rule
+  (`isRead`, `readAt` only when `isRead` is absent) for wrappers' unread
+  markers, counts and filters.
 - Constants `NOTIFICATION_GROUPS`, `NOTIFICATION_GROUP_KINDS`,
   `NOTIFICATION_STATUSES`, `SETTLED_STATUSES`, `CROSS_MESH_MODES` in
   `meshbook.resources`.

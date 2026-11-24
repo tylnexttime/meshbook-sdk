@@ -187,6 +187,17 @@ def _is_read(row: Mapping[str, Any]) -> bool | None:
     return None
 
 
+def notification_is_read(row: Mapping[str, Any]) -> bool | None:
+    """Whether a notification row (as ``list()`` returns it) is READ.
+
+    ``isRead`` decides; ``readAt`` only when ``isRead`` is absent. Use this
+    for any "unread" marker, count or filter: the server keeps ``readAt``
+    when a row is marked unread, so ``readAt`` alone calls such a row read
+    (critique C-02). None when the row carries neither key.
+    """
+    return _is_read(row)
+
+
 def _created(row: Mapping[str, Any]) -> _dt.datetime | None:
     raw = row.get("createdAt")
     if not isinstance(raw, str) or not raw.strip():
@@ -1160,4 +1171,5 @@ __all__ = [
     "NOTIFICATION_STATUSES",
     "SETTLED_STATUSES",
     "Notifications",
+    "notification_is_read",
 ]

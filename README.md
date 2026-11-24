@@ -298,7 +298,8 @@ or not a row matched. So the SDK never reads `updated`. Each write:
    `notification_not_found`; otherwise it re-reads the page the row was on
    (following it a page up or down if rows arrived meanwhile). Read state is
    `isRead`; `readAt` only counts when `isRead` is absent, because marking a
-   row unread keeps its `readAt` on the current server.
+   row unread keeps its `readAt` on the current server
+   (`meshbook.resources.notification_is_read(row)` applies that rule).
 
 A str is one id. Ids are deduplicated and lower-cased; a non-UUID, an empty
 list or more than 200 ids raise `bad_argument` before anything is sent. The

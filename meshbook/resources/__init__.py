@@ -29,6 +29,7 @@ from .notifications import (
     NOTIFICATION_STATUSES,
     SETTLED_STATUSES,
     Notifications,
+    notification_is_read,
 )
 from .work import PRIORITIES, PROJECT_ROLES, STATUSES, TASK_SORTS, Projects, Tags, Tasks
 
@@ -64,5 +65,6 @@ __all__ = [
     "Tags",
     "Tasks",
     "Users",
+    "notification_is_read",
     "recurrence_rule",
 ]
