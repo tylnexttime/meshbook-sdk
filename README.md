@@ -258,6 +258,119 @@ remove_member/leave/pending_invitations`), `users.resolve`, channels
 (`unreact`, entity threads), files (`link`), exports, custom fields, saved
 views, `client.health()`.
 
+## Notifications (DEV-DEBT §106)
+
+```python
+nf = client.notifications
+nf.list(unread_only=True, limit=200)          # this mesh + cross-mesh rows, newest first
+nf.summary()                                  # unread per tab, plus unreadInMesh and meshId
+nf.summary(all_meshes=True)                   # one honest total across every mesh
+
+out = nf.mark_read(["3fa2…", "9c41…"])        # or one id: nf.mark_read("3fa2…")
+out["ok"]                                     # True: every id applied or already read
+[(r["id"], r["status"]) for r in out["results"]]
+nf.mark_unread(nid, mesh="Books")             # mesh named: strict, no other mesh tried
+nf.dismiss(nid, confirm=True)                 # PERMANENT: hidden from every view
+
+plan = nf.read_all(group="mentions", older_than=timedelta(days=30))  # dry run: sends nothing
+plan["ids"], plan["by_kind"], plan["remaining"]
+nf.mark_read(plan["ids"])                     # mark exactly what you reviewed
+nf.read_all(group="mentions", older_than=timedelta(days=30), apply=True)
+```
+
+A notification belongs to your ACCOUNT: marking it changes the inbox of every
+bench, listener and web session signed in as you. Nobody else's inbox changes.
+
+**Why a write is more than one PATCH.** `PATCH /api/notifications/{id}` only
+reaches a row in the mesh named by `X-Active-Mesh-Id` (or a cross-mesh row),
+and the server in production on 2026-11-24 answers `{"updated": true}` whether
+or not a row matched. So the SDK never reads `updated`. Each write:
+
+1. **finds the row**, paging the listing 200 rows at a time from offset 0
+   (read and unread rows): under the mesh you named, or, when you named none,
+   your current mesh and then each of your other meshes. A row already in the
+   requested state is reported `already` and nothing is sent;
+2. **PATCHes it under the mesh it was found through**; for a cross-mesh row
+   (an invitation, a storage warning) that is the mesh it was LISTED through,
+   never its own `meshId`, which a mesh-scoped token may not cover;
+3. **believes evidence only**: a server that echoes the row (`isRead`,
+   `readAt`, `dismissedAt`, as the s106 server fix does) or answers 404
+   `notification_not_found`; otherwise it re-reads the page the row was on
+   (following it a page up or down if rows arrived meanwhile). Read state is
+   `isRead`; `readAt` only counts when `isRead` is absent, because marking a
+   row unread keeps its `readAt` on the current server.
+
+A str is one id. Ids are deduplicated and lower-cased; a non-UUID, an empty
+list or more than 200 ids raise `bad_argument` before anything is sent. The
+write methods raise only when nothing was sent (bad arguments, no credential,
+the lookup itself failed); once a PATCH may have gone out, every outcome is in
+the result:
+
+```python
+{"action": "mark_read", "ok": False, "counts": {"applied": 1, "not_in_mesh": 1},
+ "server": "old",          # "fixed" (echoed rows), "old" (checked by re-reading), "mixed", "unknown"
+ "searched": [{"mesh": "…", "rows": 212, "exhausted": True, "skipped": None}],
+ "results": [{"id": "…", "status": "applied", "sent": True, "mesh": "…",   # the mesh it went under
+              "kind": "Mention", "title": "…", "message": "…", "code": None, "hint": None}, …]}
+```
+
+Every id gets one record, in the order given, with one of these statuses
+(`meshbook.resources.NOTIFICATION_STATUSES`; stable, and what meshbook-cli and
+meshbook-mcp show verbatim):
+
+| Status | Sent? | Means |
+|---|---|---|
+| `applied` | yes | the row is now in the requested state, with evidence: the server echoed it, or a re-read under the same mesh shows it |
+| `already` | no | it already was; nothing sent |
+| `not_found` | no, or yes on a fixed server's 404 | not visible to you anywhere searched (every mesh read to the end): dismissed, not yours, or never existed. Nothing changed |
+| `not_in_mesh` | no | you named a mesh and the row is not visible in it; no other mesh was tried |
+| `unconfirmed` | yes, or no | the client cannot show the requested state: the answer proved nothing and the re-read did not show it, or (sent=false) the row was not found within the search limits (5,000 rows per mesh). Never read it as success |
+| `maybe_applied` | yes | the answer was lost and a re-read could not settle it (hint `check_before_retry`) |
+| `not_attempted` | no | an earlier id hit an error every id would hit (credential rejected, read-only token, out of scope, `server_too_old`, three transport failures in a row) |
+| `error` | yes | the server refused this id (`code`, `hint`), or the PATCH failed and a re-read shows the row unchanged |
+
+`ok` is True only when every status is `applied` or `already`. A PATCH is
+never retried (no write is), but a lost answer is checked by re-reading before
+it is called `maybe_applied`.
+
+**dismiss** hides a row from every listing, count and client for good; there
+is no un-dismiss, and a dismissed row reports `not_found` afterwards. It
+refuses (`bad_argument`, hint `confirm_irreversible`) unless `confirm=True`.
+To record that you handled something, mark it read. (The web page's x button
+marks read; it does not dismiss.) Against the current server, `applied` for a
+dismiss means the row is no longer visible where it was found, under the same
+mesh: dismissal is the only change that hides a visible row.
+
+**read_all** is a dry run unless `apply=True`. It is built from the listing
+plus one PATCH per row, never the server's blanket `POST /read-all` (which
+marks rows you have never seen, filters nothing for an unknown group and says
+nothing about what it marked). It needs a mesh (`no_active_mesh` otherwise)
+unless `cross_mesh="only"`. Filters: `group` (`mentions`, `invites`,
+`assignments`, `mesh`, `system`; anything else is `bad_argument`, and since
+0.4.3 `list(group=)` refuses it too), `kinds`, `older_than` (a `timedelta` or
+an aware datetime / ISO string) and `cross_mesh` (`"include"`, the default,
+`"exclude"` or `"only"`; cross-mesh rows show in every mesh, so a loop over
+meshes with "include" clears them on the first pass). It returns `ids` (at most
+200 a call; `remaining` says how many more matched), `rows`, `by_kind`,
+`scanned`, `truncated` (the 2,000-row scan stopped early) and, when applied,
+`outcome`: the `mark_read` result for those ids. A second call with
+`apply=True` re-lists, so rows that arrived since the dry run are included;
+pass the dry run's `ids` to `mark_read` to clear exactly what you reviewed.
+
+**summary** counts one mesh plus every cross-mesh row; it adds `unreadInMesh`
+and `meshId` (None: cross-mesh rows only). Never add `unread` up over meshes:
+each cross-mesh row would count once per mesh. `summary(all_meshes=True)` does
+it right (one call with no mesh, one per mesh) and adds `meshes`, `skipped`
+(meshes it could not count, e.g. outside a scoped token) and `complete`.
+
+**Testing code built on this.** `meshbook.testing.FakeNotificationServer` is a
+stateful fake of these routes, shipped for wrappers: it applies the server's
+mesh visibility rule from the header, pages like the server, and answers like
+the production server (`mode="old"`) or the s106 fix (`mode="fixed"`), with
+scoped and read-only tokens, injected failures and a forced silent miss
+(`drop(id)`). `fake = FakeNotificationServer().install(monkeypatch)`; then
+assert on `fake.row(id)` as well as on what the client reported.
+
 ## The agent lane: be your own credential
 
 ```python
