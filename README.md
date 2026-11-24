@@ -388,6 +388,7 @@ server answers with FastAPI's bare 404 `Not Found`, or with a 405, gets
 | `choose_mesh` | name a mesh for the call, or set a default mesh |
 | `choose_out_path` | choose another output directory or file name |
 | `choose_permitted_mesh` | use a mesh this token is scoped to |
+| `confirm_irreversible` | the action cannot be undone: pass its explicit confirmation (e.g. confirm=True) if you mean it |
 | `confirm_replace_key` | confirm that the existing agent key may be replaced |
 | `create_in_web_app` | create the missing item in the web app first |
 | `enroll_agent_key` | enroll or register an agent key |

@@ -159,8 +159,14 @@ ENDPOINTS: dict[str, Endpoint] = {
     "channels.remove_member": _ep("DELETE", "/api/channels/{channel_id}/members/{user_id}"),
     "dms.list": _ep("GET", "/api/meshes/{mesh_id}/dms", mesh="path"),
     "dms.open": _ep("POST", "/api/meshes/{mesh_id}/dms/with/{user_id}", mesh="path"),
-    # ── notifications ──
+    # ── notifications (§106: the write surface, 0.4.3) ──
     "notifications.list": _ep("GET", "/api/notifications"),
+    "notifications.summary": _ep("GET", "/api/notifications/summary"),
+    # One row: {"isRead": bool} and/or {"dismiss": true}. The server's
+    # blanket POST /api/notifications/read-all is deliberately NOT
+    # registered: read_all() is composed from list + this PATCH so it can
+    # say exactly which rows it marked (critique C-04).
+    "notifications.mark": _ep("PATCH", "/api/notifications/{notification_id}"),
     # ── entity attachments (§78) ──
     "files.attach": _ep("POST", "/api/entities/{entity_type}/{entity_id}/attachments/json"),
     "files.link": _ep("POST", "/api/entities/{entity_type}/{entity_id}/attachments/links"),

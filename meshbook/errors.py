@@ -153,6 +153,7 @@ HINT_MEANINGS: dict[str, str] = {
     "retry_later": "retry after a short wait",
     "check_before_retry": "a write may have been applied: check before retrying it",
     "check_status": "see the HTTP status and message",
+    "confirm_irreversible": "the action cannot be undone: pass its explicit confirmation (e.g. confirm=True) if you mean it",
     "fix_base_url": "use the https apex base URL",
     "allow_overwrite": "allow overwriting the existing file, or choose another path",
     "choose_out_path": "choose another output directory or file name",

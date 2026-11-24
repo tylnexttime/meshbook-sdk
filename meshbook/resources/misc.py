@@ -11,31 +11,11 @@ from ..models import Attachment, DownloadedFile, ExportJob, ItemList
 from ._base import Namespace, as_dict
 from .chat import _file_body
 
+# Since 0.4.3 notifications live in their own module (they gained a write
+# surface); this name stays importable from here for 0.4.2 callers.
+from .notifications import Notifications
 
-class Notifications(Namespace):
-    """``client.notifications``."""
-
-    def list(
-        self,
-        *,
-        unread_only: bool = False,
-        limit: int | None = None,
-        offset: int | None = None,
-        group: str | None = None,
-        kind: str | None = None,
-        mesh: str | None = None,
-    ) -> ItemList[dict[str, Any]]:
-        """GET /api/notifications — notification dicts (kind, summary,
-        readAt, createdAt, …). ``unread_only`` filters server-side; ``group``
-        is a tab key (mentions | invites | assignments | mesh | system)."""
-        params: dict[str, Any] = {
-            "unreadOnly": True if unread_only else None,
-            "group": group,
-            "kind": kind,
-        }
-        return self._c._list(
-            "notifications.list", params=params, limit=limit, offset=offset, mesh=mesh
-        )
+__all__ = ["CustomFields", "Exports", "Files", "Notifications", "SavedViews"]
 
 
 class Files(Namespace):
