@@ -564,6 +564,14 @@ Unchecked by the contract check, and envelope not stripped.
 
 ## Upgrading
 
+### From 0.4.2 to 0.4.3
+
+Additive (see [Notifications](#notifications-dev-debt-106)). The one change a
+caller can notice: `notifications.list(group=)` with anything but `mentions`,
+`invites`, `assignments`, `mesh` or `system` now raises `bad_argument`
+instead of sending a filter the server ignored. Rollback:
+`pip install "meshbook-sdk==0.4.2"`.
+
 ### From 0.4.1 to 0.4.2
 
 Nothing is removed; the changes a caller can notice:

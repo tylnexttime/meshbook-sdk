@@ -3,6 +3,71 @@
 All notable changes to meshbook-sdk are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions follow [SemVer](https://semver.org/).
 
+## [0.4.3] - 2026-11-24
+
+The notifications write surface (meshbook DEV-DEBT §106), built from the
+competitive critique of 24/11/2026 (CR-1 SDK half, CR-2, CR-3). Additive:
+every 0.4.2 call keeps its signature and return shape, so meshbook-cli and
+meshbook-mcp pinned `>=0.4.2,<0.5` can take it without a re-pin.
+
+**Rollback:** `pip install "meshbook-sdk==0.4.2"`. Nothing in 0.4.3 writes
+local state, so a downgrade needs no clean-up; a wrapper that calls the new
+methods must be rolled back with it.
+
+### Added
+- `notifications.mark_read(ids, *, mesh=None)`,
+  `notifications.mark_unread(ids, *, mesh=None)` and
+  `notifications.dismiss(ids, *, mesh=None, confirm=False)`. The server in
+  production answers a PATCH with `{"updated": true}` whether or not any row
+  matched, so these never read `updated`: each finds the row in the listing
+  (200 rows a page from offset 0, the named mesh only, or the current mesh
+  then each of your other meshes), reports `already` without sending, PATCHes
+  under the mesh the row was LISTED through (a cross-mesh row too, never its
+  own `meshId`), and believes only an echoed row, a coded 404
+  `notification_not_found` or a re-read of the page the row was on.
+  One record per id with a status from `NOTIFICATION_STATUSES` (`applied`,
+  `already`, `not_found`, `not_in_mesh`, `unconfirmed`, `maybe_applied`,
+  `not_attempted`, `error`); the batch continues past per-id failures and
+  stops (rest `not_attempted`) on a credential, read-only, scope or
+  `server_too_old` error, or three transport failures in a row. They raise
+  only when nothing was sent.
+- `notifications.read_all(*, group=None, mesh=None, apply=False,
+  older_than=None, kinds=None, cross_mesh="include")`: a DRY RUN unless
+  `apply=True`, returning exactly the ids it would mark (or marked, with the
+  per-id outcome). Composed from the listing plus one PATCH per row; the
+  server's blanket `POST /api/notifications/read-all` is never called.
+- `notifications.summary(*, mesh=None, all_meshes=False)`: the server's
+  per-tab unread counts plus `unreadInMesh` and `meshId`; `all_meshes=True`
+  totals every mesh while counting each cross-mesh row once.
+- `meshbook.testing.FakeNotificationServer`: a stateful fake of the
+  notification routes (visibility from `X-Active-Mesh-Id`, server paging,
+  the production server and the s106 server fix as two modes, scoped and
+  read-only tokens, fault injection), shipped for meshbook-cli and
+  meshbook-mcp tests.
+- Constants `NOTIFICATION_GROUPS`, `NOTIFICATION_GROUP_KINDS`,
+  `NOTIFICATION_STATUSES`, `SETTLED_STATUSES`, `CROSS_MESH_MODES` in
+  `meshbook.resources`.
+- Hint `confirm_irreversible` (on `bad_argument` from `dismiss()` without
+  `confirm=True`).
+- Registry entries `notifications.summary` (GET) and `notifications.mark`
+  (PATCH). The SDK now calls 95 operations, all in the pinned spec.
+
+### Changed
+- `notifications.list(group=)` refuses a group that is not one of
+  `mentions`, `invites`, `assignments`, `mesh`, `system` (`bad_argument`,
+  nothing sent); a known one is matched case-insensitively and sent in
+  lower case. The server silently ignored an unknown group and filtered
+  nothing, so such a call never did what it said.
+- `Notifications` moved to `meshbook/resources/notifications.py`; it is
+  still importable from `meshbook.resources.misc`.
+- Internal: `MeshbookClient._call(send_mesh=False)` sends no
+  `X-Active-Mesh-Id` even when the client has a mesh.
+
+### Contract
+- The pinned spec is unchanged (server main 350ac77). The s106 server fix
+  (branch `s106-notifications`, not deployed) changes the PATCH body schema
+  only; re-pin from the server's main once it is merged and deployed.
+
 ## [0.4.2] - 2026-10-19
 
 Follows the server's 2026-10-19 critique hotfix (C-01) and the "left open"
