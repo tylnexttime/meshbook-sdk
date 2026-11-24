@@ -1076,9 +1076,17 @@ class MeshbookClient:
         mesh: str | None = None,
         token: str | None = None,
         headers: Mapping[str, str] | None = None,
+        send_mesh: bool = True,
     ) -> Any:
         """The ONLY way namespace code reaches the network: a registry key
-        from :mod:`meshbook._endpoints`, never a free-form path."""
+        from :mod:`meshbook._endpoints`, never a free-form path.
+
+        ``send_mesh=False`` sends no ``X-Active-Mesh-Id`` at all, even when
+        the client has a mesh (``mesh=None`` means "the client's mesh"). The
+        notification routes need it: with no header they see only the
+        cross-mesh rows, which is how an all-meshes total avoids counting
+        those rows once per mesh.
+        """
         ep = ENDPOINTS[key]
         return self._send(
             ep.method,
@@ -1087,7 +1095,7 @@ class MeshbookClient:
             params=params,
             require_auth=ep.auth,
             token=token,
-            mesh_id=self._endpoint_mesh(ep, path, mesh),
+            mesh_id=self._endpoint_mesh(ep, path, mesh) if send_mesh else None,
             extra_headers=headers,
             known_route=True,
         )
