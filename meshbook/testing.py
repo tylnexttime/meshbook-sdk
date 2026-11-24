@@ -171,8 +171,8 @@ class _Response:
     def __enter__(self) -> _Response:
         return self
 
-    def __exit__(self, *exc: Any) -> bool:
-        return False
+    def __exit__(self, *exc: Any) -> None:
+        return None
 
 
 class _Reply(Exception):

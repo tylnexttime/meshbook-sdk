@@ -507,7 +507,11 @@ class Notifications(Namespace):
     def _summary_one(self, mid: str | None) -> dict[str, Any]:
         out = dict(self._summary_raw(mid))
         unread, cross = out.get("unread"), out.get("unreadCrossMesh")
-        out["unreadInMesh"] = unread - cross if _is_count(unread) and _is_count(cross) else None
+        out["unreadInMesh"] = (
+            int(unread) - int(cross)
+            if isinstance(unread, int) and isinstance(cross, int) and _is_count(unread) and _is_count(cross)
+            else None
+        )
         out["meshId"] = mid
         out["allMeshes"] = False
         return out
