@@ -951,3 +951,31 @@ def test_group_kinds_match_a_server_checkout_beside_this_repo():
     else:
         pytest.fail("GROUP_KINDS not found in the server router")
     assert {k: tuple(v) for k, v in theirs.items()} == NOTIFICATION_GROUP_KINDS
+
+
+# ─── the two judgements everything rests on ─────────────────────────────
+
+
+@pytest.mark.parametrize("action", ["mark_read", "mark_unread", "dismiss"])
+def test_a_bare_updated_proves_nothing(action):
+    nid = str(uuid.uuid4())
+    assert nmod._judge({"id": nid, "updated": True}, action) == "unknown"
+    assert nmod._judge({"noop": True}, action) == "unknown"
+    assert nmod._judge(None, action) == "unknown"
+
+
+def test_an_echoed_row_is_judged_by_its_state():
+    echo = {"id": "x", "updated": True, "isRead": True, "readAt": "t", "dismissedAt": None}
+    assert nmod._judge(echo, "mark_read") == "applied"
+    assert nmod._judge(echo, "mark_unread") == "mismatch"
+    assert nmod._judge(echo, "dismiss") == "mismatch"
+    assert nmod._judge({**echo, "dismissedAt": "t"}, "dismiss") == "applied"
+    assert nmod._judge({**echo, "isRead": "true"}, "mark_read") == "unknown"  # not a bool
+
+
+def test_is_read_prefers_is_read_over_read_at():
+    assert nmod._is_read({"isRead": False, "readAt": "2026-05-01T00:00:00+00:00"}) is False
+    assert nmod._is_read({"isRead": True, "readAt": None}) is True
+    assert nmod._is_read({"readAt": "2026-05-01T00:00:00+00:00"}) is True  # older shape only
+    assert nmod._is_read({"readAt": None}) is False
+    assert nmod._is_read({}) is None
